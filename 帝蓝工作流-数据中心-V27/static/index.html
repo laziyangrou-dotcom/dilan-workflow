@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>帝蓝工作流-数据中心</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="app">
+  <header class="top">
+    <div class="brand"><i>蓝</i><span id="brandTitle">帝蓝工作流-数据中心</span></div>
+    <span class="pill" id="lanInfo">局域网项目仓库</span>
+    <div class="spacer"></div>
+    <button class="btn ghost" onclick="openTransfers()">下载管理</button>
+    <button class="btn ghost" onclick="openConfig()">数据中心设置</button>
+    <button class="btn ghost" onclick="loadProjects()">刷新</button>
+  </header>
+
+  <div class="body">
+    <aside class="parent-pane">
+      <div class="pane-title">父项目</div>
+      <div class="desc">点击父项目查看其下子项目；可整包下载整个父项目。</div>
+      <div id="parentList" class="parent-list"></div>
+    </aside>
+
+    <section class="child-pane">
+      <div class="module-bar">
+        <div class="module-list" id="moduleList"></div>
+        <div class="module-actions">
+          <button class="btn ghost" onclick="chooseUpload()">手动上传工程包</button>
+          <button class="btn ghost" id="mergeToggleBtn" onclick="toggleMergeMode()">合并子项目</button>
+          <button class="btn" id="mergeRunBtn" style="display:none" onclick="runMerge()">执行合并(0)</button>
+        </div>
+      </div>
+      <div class="child-toolbar">
+        <div id="currentParentTitle"><b>当前父项目：</b>未选择</div>
+        <span class="pill" id="moduleCount">—</span>
+        <div class="source-switch" id="sourceSwitch">
+          <button class="src-btn" data-src="creator" onclick="switchSource('creator')">制作端</button>
+          <button class="src-btn" data-src="reviewer" onclick="switchSource('reviewer')">审核端</button>
+        </div>
+      </div>
+      <div id="childList" class="child-list"></div>
+    </section>
+  </div>
+</div>
+
+<input type="file" id="uploadFile" class="hidden-file" accept=".zip,application/zip">
+
+<!-- 上传冲突弹窗 -->
+<div class="modal" id="conflictModal">
+  <div class="modal-card">
+    <h2>已存在同名子项目</h2>
+    <p id="conflictDesc"></p>
+    <div class="modal-actions">
+      <button class="btn ghost" onclick="closeConflict()">取消</button>
+      <button class="btn ghost" onclick="resolveConflict('new_version')">生成新版本</button>
+      <button class="btn danger" onclick="resolveConflict('overwrite')">覆盖已有</button>
+    </div>
+  </div>
+</div>
+
+<!-- 设置弹窗 -->
+<div class="modal" id="configModal">
+  <div class="modal-card">
+    <h2>数据中心设置</h2>
+    <p>这些设置只影响数据中心本身。监听端口修改后需重启服务端生效。</p>
+    <label class="cfg-row">服务名称<input class="field" id="cfgName"></label>
+    <label class="cfg-row">监听端口<input class="field" id="cfgPort" type="number"></label>
+    <div class="modal-actions">
+      <button class="btn ghost" onclick="closeConfig()">关闭</button>
+      <button class="btn" onclick="saveConfigUI()">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 下载管理面板 -->
+<div class="modal" id="transfersModal">
+  <div class="modal-card" style="max-width:680px;width:92%">
+    <h2>下载管理</h2>
+    <p>显示本数据中心收到的上传 / 发出的下载任务。注：若某台机器连不上数据中心，请求不会到达这里，请检查该机器的网络与地址设置。</p>
+    <div id="transfersList" style="max-height:50vh;overflow:auto"></div>
+    <div class="modal-actions">
+      <button class="btn ghost" onclick="closeTransfers()">关闭</button>
+      <button class="btn" onclick="refreshTransfers()">刷新</button>
+    </div>
+  </div>
+</div>
+
+<!-- 预览弹窗 -->
+<div class="preview-modal" id="previewModal" onclick="this.classList.remove('show')">
+  <img id="previewImg" alt="预览">
+</div>
+
+<div class="toast" id="toast"></div>
+<script src="/script.js"></script>
+</body>
+</html>

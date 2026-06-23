@@ -1,0 +1,2 @@
+# No third-party dependencies are required.
+# The integrated launcher and both tools use only the Python standard library.

@@ -1,0 +1,88 @@
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;background:#0a0c0f;color:#e8eaed;font-family:'Microsoft YaHei',Arial,sans-serif;overflow:hidden}
+button,input,select,textarea{font-family:inherit}
+.hidden-file{display:none}
+.app{height:100vh;display:flex;flex-direction:column}
+.top{height:52px;display:flex;align-items:center;gap:10px;padding:0 14px;border-bottom:1px solid rgba(255,255,255,.08);background:#090b0e;flex-shrink:0}
+.brand{font-weight:900;display:flex;align-items:center;gap:8px;font-size:16px}
+.brand i{width:26px;height:26px;border-radius:8px;background:#00e5a0;color:#00120c;display:flex;align-items:center;justify-content:center;font-style:normal;font-size:15px}
+.spacer{flex:1}
+.pill{background:#14191f;border:1px solid rgba(255,255,255,.1);border-radius:9px;padding:5px 9px;font-size:12px;color:#8a9098}
+.pill b{color:#fff}
+.btn{border:0;border-radius:10px;background:#00e5a0;color:#00120c;font-weight:800;padding:7px 12px;cursor:pointer;font-size:13px}
+.btn:hover{filter:brightness(1.07)}
+.btn.ghost{background:#171d24;color:#e8eaed;border:1px solid rgba(255,255,255,.13)}
+.btn.danger{background:rgba(255,92,92,.08);color:#ff7777;border:1px solid rgba(255,92,92,.35)}
+.btn.small{padding:5px 9px;font-size:12px}
+.btn.disabled{opacity:.45;cursor:not-allowed}
+.field{background:#171d24;border:1px solid rgba(255,255,255,.12);color:#e8eaed;border-radius:8px;padding:7px 9px;outline:none;width:100%}
+.field:focus{border-color:#00e5a0}
+.desc{font-size:12px;color:#8a9098;margin-bottom:14px;line-height:1.6}
+
+.body{flex:1;display:flex;min-height:0}
+.parent-pane{width:330px;flex-shrink:0;background:#0d1116;border-right:1px solid rgba(255,255,255,.08);padding:18px 18px;overflow:auto}
+.child-pane{flex:1;min-width:0;background:#0b1015;padding:0;overflow:auto;display:flex;flex-direction:column}
+.pane-title{font-size:18px;font-weight:900;margin:0 0 4px}
+
+.parent-list{display:flex;flex-direction:column;gap:10px}
+.parent-card{border:1px solid rgba(255,255,255,.09);background:#111820;border-radius:14px;padding:12px;cursor:pointer;transition:.12s}
+.parent-card:hover{border-color:rgba(0,229,160,.35)}
+.parent-card.active{border-color:rgba(0,229,160,.55);background:rgba(0,229,160,.07)}
+.parent-card .pname{font-size:15px;font-weight:900;margin-bottom:6px}
+.parent-card .pcount{font-size:12px;color:#8a9098;margin-bottom:3px}
+.parent-card .ptime{font-size:11px;color:#596271;margin-bottom:9px}
+.parent-card .pactions{display:flex;gap:6px}
+
+.module-bar{display:flex;align-items:center;min-height:70px;padding:14px 22px;border-bottom:1px solid rgba(255,255,255,.08);background:#0d1116;position:sticky;top:0;z-index:5}
+.module-list{display:flex;flex-direction:row;align-items:center;gap:14px}
+.module-actions{margin-left:auto;display:flex;align-items:center;gap:8px}
+.module-card{appearance:none;min-width:92px;height:42px;border:1px solid rgba(255,255,255,.14);background:#151b23;color:#e8eaed;border-radius:999px;padding:0 22px;font-size:18px;font-weight:900;line-height:1;display:inline-flex;align-items:center;justify-content:center;cursor:pointer}
+.module-card.active{border-color:rgba(0,229,160,.65);background:#00e5a0;color:#00120c;box-shadow:0 0 18px rgba(0,229,160,.18)}
+
+.child-toolbar{display:flex;align-items:center;gap:10px;padding:14px 22px 4px}
+.child-list{padding:8px 22px 24px;display:flex;flex-direction:column;gap:10px}
+.child-card{border:1px solid rgba(255,255,255,.09);background:#111820;border-radius:14px;padding:12px;display:flex;gap:14px;align-items:center}
+.child-thumb{width:120px;height:72px;flex-shrink:0;border-radius:10px;background:#050607;border:1px solid rgba(255,255,255,.08);overflow:hidden;display:flex;align-items:center;justify-content:center}
+.child-thumb img{width:100%;height:100%;object-fit:contain}
+.child-thumb .noimg{color:#3a4452;font-size:11px}
+.child-main{flex:1;min-width:0}
+.child-title{font-size:15px;font-weight:900;margin-bottom:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.child-meta{font-size:12px;color:#8a9098;line-height:1.7}
+.child-meta .k{color:#596271}
+.child-actions{display:flex;flex-direction:column;gap:6px;flex-shrink:0}
+
+.empty-center{text-align:center;color:#596271;padding:50px 10px;font-size:13px}
+
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.75);display:none;align-items:center;justify-content:center;z-index:1200}
+.modal.show{display:flex}
+.modal-card{width:min(460px,92vw);background:#111820;border:1px solid rgba(255,255,255,.12);border-radius:18px;padding:22px;box-shadow:0 18px 70px rgba(0,0,0,.6)}
+.modal-card h2{margin:0 0 8px;font-size:19px}
+.modal-card p{color:#8a9098;font-size:13px;line-height:1.7;margin:0 0 14px}
+.modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
+.cfg-row{display:flex;flex-direction:column;gap:6px;font-size:13px;color:#8a9098;margin-bottom:12px}
+
+.preview-modal{position:fixed;inset:0;background:rgba(0,0,0,.85);display:none;align-items:center;justify-content:center;z-index:1300}
+.preview-modal.show{display:flex}
+.preview-modal img{max-width:92vw;max-height:92vh;object-fit:contain}
+
+.toast{position:fixed;left:50%;bottom:30px;transform:translateX(-50%);background:#171d24;border:1px solid rgba(255,255,255,.14);border-radius:12px;padding:11px 16px;color:#fff;display:none;z-index:2000;max-width:80vw}
+.toast.show{display:block}
+
+@media(max-width:900px){
+  .parent-pane{width:240px}
+  .child-card{flex-wrap:wrap}
+  .child-thumb{width:100%;height:120px}
+}
+
+/* 来源切换（制作端/审核端 二选一） */
+.source-switch{margin-left:auto;display:inline-flex;gap:6px;background:#0d1116;border:1px solid rgba(255,255,255,.1);border-radius:999px;padding:4px}
+.src-btn{appearance:none;border:0;background:transparent;color:#8a9098;font-weight:800;font-size:13px;padding:6px 16px;border-radius:999px;cursor:pointer;line-height:1}
+.src-btn:hover{color:#e8eaed}
+.src-btn.active{background:#00e5a0;color:#00120c;box-shadow:0 0 14px rgba(0,229,160,.18)}
+
+/* 合并选择模式 */
+.child-card.merge-mode{cursor:pointer}
+.child-card.merge-mode:hover{border-color:rgba(0,229,160,.5)}
+.child-card.merge-picked{border-color:#00e5a0;background:rgba(0,229,160,.08)}
+.child-card{position:relative}
+.merge-badge{position:absolute;top:8px;left:8px;width:24px;height:24px;border-radius:50%;background:#00e5a0;color:#00120c;font-weight:900;display:flex;align-items:center;justify-content:center;font-size:13px;z-index:2}

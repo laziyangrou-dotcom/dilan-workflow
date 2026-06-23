@@ -1,0 +1,2 @@
+第一次运行请双击“安装.bat”，它会创建 .venv 虚拟环境并安装 requirements.txt 中的依赖。
+安装完成后，之后运行请双击“start.bat”。
