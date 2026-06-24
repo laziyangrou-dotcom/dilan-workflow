@@ -6,3 +6,13 @@ __pycache__/
 # 操作系统
 .DS_Store
 Thumbs.db
+
+# 制作端各子工具的运行时产物(原始包不含,运行/测试时生成)
+**/tools/*/projects/
+**/tools/*/output/
+**/tools/*/input/
+**/tools/*/exports/
+**/tools/*/snapshots/
+**/tools/*/operation_logs/
+**/tools/*/temp/
+**/tools/*/usage.json

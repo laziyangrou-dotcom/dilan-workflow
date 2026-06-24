@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import time
+import threading
 import uuid
 import urllib.request
 import urllib.error
@@ -692,6 +693,25 @@ def create_project_data(name, parent_id=None, scene_start=None, scene_end=None):
         "scenes": scenes,
     }
     return normalize_project(data, rename_dirs=False)
+
+
+_PROJECT_MUTATION_LOCKS = {}
+_PROJECT_MUTATION_LOCKS_GUARD = threading.Lock()
+
+
+def project_mutation_lock(pid):
+    """Per-project lock so concurrent video-generate / running-status / save
+    operations serialize their read-modify-write of the project JSON. Without
+    it, parallel Seedance tasks could lose each other's appended videos
+    (last-write-wins). The slow Seedance poll stays OUTSIDE this lock so
+    generations still run in parallel; only the brief load->save is serialized."""
+    key = str(pid or "")
+    with _PROJECT_MUTATION_LOCKS_GUARD:
+        lk = _PROJECT_MUTATION_LOCKS.get(key)
+        if lk is None:
+            lk = threading.RLock()
+            _PROJECT_MUTATION_LOCKS[key] = lk
+    return lk
 
 
 def load_project(pid):
@@ -4299,8 +4319,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pid = safe_name(body.get("project") or body.get("project_id") or "project")
         data = body.get("data") or body
         data.pop("apiKey", None)
-        saved = save_project(pid, data)
-        append_operation_log(saved["project_id"], "project_save", user_name="系统", stats=project_stats(saved))
+        _lock = project_mutation_lock(pid)
+        _lock.acquire()
+        try:
+            saved = save_project(pid, data)
+            append_operation_log(saved["project_id"], "project_save", user_name="系统", stats=project_stats(saved))
+        finally:
+            _lock.release()
         self.send_json(200, {"ok": True, "data": saved, "project": project_meta(saved["project_id"])})
 
     def api_project_delete(self):
@@ -4825,91 +4850,110 @@ class Handler(http.server.BaseHTTPRequestHandler):
             debug_context["settings"] = sanitize_for_log(settings)
             debug_context["cost_details"] = sanitize_for_log(cost_details)
             started_at = now_str()
+            gen_t0 = time.monotonic()
 
             def persist_running_status(task_id="", created_response=None):
                 """Persist running state so refresh/reopen keeps the generating video visible."""
                 try:
-                    running_data = load_project(pid)
-                    _scene, _shot, _tab = find_tab(running_data, shot_id, tab_id)
-                    _tab["draft_prompt"] = user_text
-                    status = {
-                        "state": "running",
-                        "time": now_str(),
-                        "started_at": started_at,
-                        "task_id": task_id or "",
-                        "message": "视频正在生成中。刷新页面后会保留正在生成状态，任务完成后会自动写回结果。",
-                        "prompt": user_text,
-                        "settings": sanitize_for_log(dict(settings)),
-                        "cost_details": sanitize_for_log(cost_details),
-                    }
-                    if created_response is not None:
-                        status["created_response"] = sanitize_for_log(created_response)
-                    _tab["last_video_status"] = status
-                    save_project(pid, running_data)
+                    _lock = project_mutation_lock(pid)
+                    _lock.acquire()
+                    try:
+                        running_data = load_project(pid)
+                        _scene, _shot, _tab = find_tab(running_data, shot_id, tab_id)
+                        _tab["draft_prompt"] = user_text
+                        status = {
+                            "state": "running",
+                            "time": now_str(),
+                            "started_at": started_at,
+                            "task_id": task_id or "",
+                            "message": "视频正在生成中。刷新页面后会保留正在生成状态，任务完成后会自动写回结果。",
+                            "prompt": user_text,
+                            "settings": sanitize_for_log(dict(settings)),
+                            "cost_details": sanitize_for_log(cost_details),
+                        }
+                        if created_response is not None:
+                            status["created_response"] = sanitize_for_log(created_response)
+                        _tab["last_video_status"] = status
+                        save_project(pid, running_data)
+                    finally:
+                        _lock.release()
                 except Exception as status_exc:
                     print("Failed to persist Seedance running status:", status_exc, flush=True)
 
             persist_running_status()
             print_seedance_request_debug(debug_context, payload)
             task_id, remote_url, detail = submit_and_wait_seedance(api_key, payload, on_created=persist_running_status)
-            latest = load_project(pid)
-            scene2, shot2, tab2, user_msg_id = apply_user_message_for_submit(latest, shot_id, tab_id, user_text, redo_id)
-            tab2["draft_prompt"] = user_text
-            # @ 引用只允许使用当前标签页引用素材，不再从全局素材库自动补引用。
-            scene_code = safe_file_name(scene2.get("scene_code") or "SC", "SC")
-            out_dir = OUTPUT_VIDEO_DIR / safe_name(pid) / scene_code / shot2.get("shot_id") / tab2.get("tab_id")
-            out = download_video_to_project(remote_url, out_dir, settings.get("video_resolution"), settings.get("video_ratio"))
-            file_url = "/output/video/" + out.relative_to(OUTPUT_VIDEO_DIR).as_posix()
-            thumb = create_video_thumbnail(out)
-            thumb_url = public_thumb_url(thumb)
-            vid = {
-                "image_id": new_id("vid"),
-                "video_id": None,
-                "media_type": "video",
-                "file_path": file_url,
-                "thumb_path": thumb_url,
-                "remote_url": remote_url,
-                "task_id": task_id,
-                "created_at": now_str(),
-                "operation": "seedance_generate",
-                "user_message": user_text,
-                "prompt": user_text,
-                "payload": sanitize_payload_for_record(payload),
-                "settings": dict(settings),
-                "cost_details": cost_details,
-                "source_message_id": user_msg_id,
-                "tab_id": tab2.get("tab_id"),
-            }
-            vid["video_id"] = vid["image_id"]
-            tab2.setdefault("generated_images", []).append(vid)
-            tab2["generated_videos"] = tab2.get("generated_images", [])
-            tab2["current_base_image_id"] = vid["image_id"]
-            tab2["last_video_status"] = {
-                "state": "success", "time": now_str(), "task_id": task_id,
-                "cost_details": cost_details, "file_path": file_url,
-                "message": f"视频生成完成，本次预估消耗 ¥{cost_details.get('estimated_cny', 0):.4f}。"
-            }
-            tab2.setdefault("messages", []).append({"message_id": new_id("msg"), "role": "assistant", "content": "已生成 1 条视频。", "time": now_str(), "operation": "seedance_generate", "kind": "generate", "image_id": vid["image_id"], "video_id": vid["video_id"], "reply_to_message_id": user_msg_id})
-            usage = record_usage(user_name, "video", cost_details.get("model_id") or normalize_video_model(settings.get("video_model")), cost_details.get("estimated_tokens") or 0, pid, shot2.get("shot_id"), tab2.get("tab_id"), scene=scene2, shot=shot2, cny=cost_details.get("estimated_cny") or 0, cost_details=cost_details)
-            save_project(pid, latest)
+            gen_seconds = round(time.monotonic() - gen_t0, 1)
+            _lock = project_mutation_lock(pid)
+            _lock.acquire()
+            try:
+                latest = load_project(pid)
+                scene2, shot2, tab2, user_msg_id = apply_user_message_for_submit(latest, shot_id, tab_id, user_text, redo_id)
+                tab2["draft_prompt"] = user_text
+                # @ 引用只允许使用当前标签页引用素材，不再从全局素材库自动补引用。
+                scene_code = safe_file_name(scene2.get("scene_code") or "SC", "SC")
+                out_dir = OUTPUT_VIDEO_DIR / safe_name(pid) / scene_code / shot2.get("shot_id") / tab2.get("tab_id")
+                out = download_video_to_project(remote_url, out_dir, settings.get("video_resolution"), settings.get("video_ratio"))
+                file_url = "/output/video/" + out.relative_to(OUTPUT_VIDEO_DIR).as_posix()
+                thumb = create_video_thumbnail(out)
+                thumb_url = public_thumb_url(thumb)
+                vid = {
+                    "image_id": new_id("vid"),
+                    "video_id": None,
+                    "media_type": "video",
+                    "file_path": file_url,
+                    "thumb_path": thumb_url,
+                    "remote_url": remote_url,
+                    "task_id": task_id,
+                    "created_at": now_str(),
+                    "operation": "seedance_generate",
+                    "user_message": user_text,
+                    "prompt": user_text,
+                    "payload": sanitize_payload_for_record(payload),
+                    "settings": dict(settings),
+                    "cost_details": cost_details,
+                    "source_message_id": user_msg_id,
+                    "tab_id": tab2.get("tab_id"),
+                    "generation_seconds": gen_seconds,
+                }
+                vid["video_id"] = vid["image_id"]
+                tab2.setdefault("generated_images", []).append(vid)
+                tab2["generated_videos"] = tab2.get("generated_images", [])
+                tab2["current_base_image_id"] = vid["image_id"]
+                tab2["last_video_status"] = {
+                    "state": "success", "time": now_str(), "task_id": task_id,
+                    "cost_details": cost_details, "file_path": file_url,
+                    "generation_seconds": gen_seconds,
+                    "message": f"视频生成完成，本次预估消耗 ¥{cost_details.get('estimated_cny', 0):.4f}。"
+                }
+                tab2.setdefault("messages", []).append({"message_id": new_id("msg"), "role": "assistant", "content": "已生成 1 条视频。", "time": now_str(), "operation": "seedance_generate", "kind": "generate", "image_id": vid["image_id"], "video_id": vid["video_id"], "reply_to_message_id": user_msg_id})
+                usage = record_usage(user_name, "video", cost_details.get("model_id") or normalize_video_model(settings.get("video_model")), cost_details.get("estimated_tokens") or 0, pid, shot2.get("shot_id"), tab2.get("tab_id"), scene=scene2, shot=shot2, cny=cost_details.get("estimated_cny") or 0, cost_details=cost_details)
+                save_project(pid, latest)
+            finally:
+                _lock.release()
             self.send_json(200, {"ok": True, "data": latest, "video": vid, "image": vid, "task_id": task_id, "remote_url": remote_url, "mode": "generate", "usage": usage, "cost_details": cost_details})
         except Exception as e:
             report = build_seedance_error_report(e, payload=payload, context=debug_context)
             print_seedance_error_debug(report)
             err_data = None
             try:
-                err_data = load_project(pid) if pid else None
-                if err_data:
-                    _scene, _shot, _tab = find_tab(err_data, shot_id, tab_id)
-                    _tab["last_video_status"] = {
-                        "state": "error",
-                        "time": now_str(),
-                        "message": report.get("message_cn") or "视频生成失败。",
-                        "error": report.get("exception") or "",
-                        "error_detail_text": report.get("detail_text") or "",
-                        "error_report": sanitize_for_log(report),
-                    }
-                    save_project(pid, err_data)
+                _lock = project_mutation_lock(pid)
+                _lock.acquire()
+                try:
+                    err_data = load_project(pid) if pid else None
+                    if err_data:
+                        _scene, _shot, _tab = find_tab(err_data, shot_id, tab_id)
+                        _tab["last_video_status"] = {
+                            "state": "error",
+                            "time": now_str(),
+                            "message": report.get("message_cn") or "视频生成失败。",
+                            "error": report.get("exception") or "",
+                            "error_detail_text": report.get("detail_text") or "",
+                            "error_report": sanitize_for_log(report),
+                        }
+                        save_project(pid, err_data)
+                finally:
+                    _lock.release()
             except Exception:
                 err_data = load_project(pid) if pid else None
             self.send_json(500, {

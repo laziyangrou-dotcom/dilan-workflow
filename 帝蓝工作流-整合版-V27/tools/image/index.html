@@ -42,6 +42,7 @@
 .asset-card,.library-card{user-select:none}
 .library-card input{user-select:text}
 .img-map{font-size:11px;color:#8a9098;background:#07090c;border-top:1px solid rgba(255,255,255,.08);padding:4px 6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.img-time{font-size:11px;color:#7fb88a;background:#07090c;border-top:1px solid rgba(255,255,255,.06);padding:3px 6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .gen-img .img-map+.img-actions{bottom:30px}
 </style>
 </head>
@@ -129,6 +130,12 @@ function sideCurrentPage(cat){let p=sidePage[cat]||0;const mx=sidePageCount(cat)
 function sidePageAssets(cat){const p=sideCurrentPage(cat);return sideAssetsOf(cat).slice(p*SIDE_PAGE_SIZE,(p+1)*SIDE_PAGE_SIZE)}
 function setSidePage(cat,p){const mx=sidePageCount(cat)-1;sidePage[cat]=Math.min(Math.max(0,p),mx);renderSideAssets()}
 let selectedBase={}, pendingState={}, redoState={}, drafts={}, storyIndex={}, storyViewMode={}, terminalOpen=false, terminalLogs=[];
+// 需求2/3：每个标签页可有多条并发生成任务（genTasks[tabId] = [{id,start,label}]），各自实时计时。
+let genTasks={};
+function updateElapsed(){document.querySelectorAll('.gen-elapsed').forEach(el=>{const s=Number(el.dataset.start||Date.now());el.textContent=Math.max(0,Math.floor((Date.now()-s)/1000))})}
+setInterval(updateElapsed,1000);
+function removeGenTask(tabId,taskId){const arr=genTasks[tabId];if(!arr)return;const i=arr.findIndex(t=>t.id===taskId);if(i>=0)arr.splice(i,1);if(!arr.length)delete genTasks[tabId]}
+function findTabInData(data,tabId){if(!data||!data.scenes)return null;for(const s of (data.scenes||[])){for(const h of (s.shots||[])){for(const t of (h.tabs||[])){if(t.tab_id===tabId)return t}}}return null}
 let selectedAssets=new Set(), selecting=false, selectStart=null;
 let storageBatchMode=false, selectedStorageImages=new Set(), storageSelecting=false, storageSelectStart=null;
 let currentUserName='';
@@ -384,7 +391,7 @@ function messageViewIndex(m){const vs=messageVersions(m);let i=Number(m.version_
 function messageDisplayContent(m){const vs=messageVersions(m);return vs[messageViewIndex(m)]?.content||''}
 function messageVersionControls(shotId,tabId,m,locked){const vs=messageVersions(m);if(vs.length<=1)return '';const idx=messageViewIndex(m);return `<span class="msg-version"><button class="mini" ${idx<=0?'disabled':''} onclick="switchMessageVersion('${shotId}','${tabId}','${m.message_id}',-1)">‹</button><span>${idx+1}/${vs.length}</span><button class="mini" ${idx>=vs.length-1?'disabled':''} onclick="switchMessageVersion('${shotId}','${tabId}','${m.message_id}',1)">›</button></span>`}
 function switchMessageVersion(shotId,tabId,msgId,d){const f=shotById(shotId);if(!f)return;const t=f.shot.tabs.find(x=>x.tab_id===tabId)||activeTab(f.shot);const m=(t.messages||[]).find(x=>x.message_id===msgId);if(!m)return;const vs=messageVersions(m);m.version_view_index=Math.min(Math.max(messageViewIndex(m)+d,0),vs.length-1);renderScenes();saveProject()}
-function renderMessages(shot,tab){const locked=!canEditShot(shot.shot_id);const pending=pendingState[tab.tab_id];return (tab.messages||[]).map(m=>`<div class="msg ${m.role}"><div class="msg-role">${m.role==='user'?'用户':'系统'} · ${esc(m.time||'')} ${m.role==='user'?messageVersionControls(shot.shot_id,tab.tab_id,m,locked):''}</div><div class="bubble-row"><div class="bubble">${esc(messageDisplayContent(m))}</div>${m.role==='user'?`<button class="redo-btn" ${locked?'disabled':''} onclick="redoFromMessage('${shot.shot_id}','${tab.tab_id}','${m.message_id}')">↺ 重做</button>`:''}</div></div>`).join('')+(pending?`<div class="msg assistant"><div class="msg-role">系统 · 等待中</div><div class="bubble">⏳ ${esc(pending)}</div></div>`:'')}
+function renderMessages(shot,tab){const locked=!canEditShot(shot.shot_id);const pending=pendingState[tab.tab_id];const tasks=genTasks[tab.tab_id]||[];return (tab.messages||[]).map(m=>`<div class="msg ${m.role}"><div class="msg-role">${m.role==='user'?'用户':'系统'} · ${esc(m.time||'')} ${m.role==='user'?messageVersionControls(shot.shot_id,tab.tab_id,m,locked):''}</div><div class="bubble-row"><div class="bubble">${esc(messageDisplayContent(m))}</div>${m.role==='user'?`<button class="redo-btn" ${locked?'disabled':''} onclick="redoFromMessage('${shot.shot_id}','${tab.tab_id}','${m.message_id}')">↺ 重做</button>`:''}</div></div>`).join('')+(pending?`<div class="msg assistant"><div class="msg-role">系统 · 等待中</div><div class="bubble">⏳ ${esc(pending)}</div></div>`:'')+tasks.map(t=>`<div class="msg assistant"><div class="msg-role">系统 · 生成中</div><div class="bubble">⏳ ${esc(t.label||'正在生成图片…')} <span class="gen-elapsed" data-start="${t.start}">0</span> 秒</div></div>`).join('')}
 function executionMappingSummary(img){
     const sheet=img.execution_sheet||{};
     const map=img.final_execution_mapping||sheet.final_execution_mapping||[];
@@ -393,7 +400,7 @@ function executionMappingSummary(img){
 }
 function renderImages(shot,tab){
     const locked=!canEditShot(shot.shot_id);
-    const _imgs=(tab.generated_images||[]).filter(im=>im&&im.operation!=='manual_storyboard');return _imgs.length?`<div class="image-grid">${_imgs.map(img=>{const mapping=executionMappingSummary(img);return `<div class="gen-img"><img draggable="true" ondragstart="generatedImageDrag(event,'${shot.shot_id}','${img.image_id}')" ondblclick="openPreview('${img.file_path}')" src="${img.file_path}">${mapping?`<div class="img-map" title="${esc(mapping)}">映射：${esc(mapping)}</div>`:''}<div class="img-actions"><button class="overlay-btn" ${locked?'disabled':''} onclick="editFromImage('${tab.tab_id}','${img.image_id}')">编辑</button><button class="overlay-btn" ${locked?'disabled':''} onclick="addCandidate('${shot.shot_id}','${img.image_id}')">确认</button><button class="overlay-btn danger" ${locked?'disabled':''} onclick="deleteGeneratedImage('${shot.shot_id}','${img.image_id}')">删除</button></div></div>`}).join('')}</div>`:''
+    const _imgs=(tab.generated_images||[]).filter(im=>im&&im.operation!=='manual_storyboard');return _imgs.length?`<div class="image-grid">${_imgs.map(img=>{const mapping=executionMappingSummary(img);return `<div class="gen-img"><img draggable="true" ondragstart="generatedImageDrag(event,'${shot.shot_id}','${img.image_id}')" ondblclick="openPreview('${img.file_path}')" src="${img.file_path}">${mapping?`<div class="img-map" title="${esc(mapping)}">映射：${esc(mapping)}</div>`:''}${img.generation_seconds!=null?`<div class="img-time">生成总时间：${esc(String(img.generation_seconds))} 秒</div>`:''}<div class="img-actions"><button class="overlay-btn" ${locked?'disabled':''} onclick="editFromImage('${tab.tab_id}','${img.image_id}')">编辑</button><button class="overlay-btn" ${locked?'disabled':''} onclick="addCandidate('${shot.shot_id}','${img.image_id}')">确认</button><button class="overlay-btn danger" ${locked?'disabled':''} onclick="deleteGeneratedImage('${shot.shot_id}','${img.image_id}')">删除</button></div></div>`}).join('')}</div>`:''
 }
 function renderComposer(shot,tab){const locked=!canEditShot(shot.shot_id);const k=tab.tab_id, redo=redoState[k], base=selectedBase[k];const pst=promptUiState[k]||{};const h=cleanPx(tab.prompt_box_height||pst.height||180,180);const ph='gpt生图：普通输入会聊天；确认后输入“开始生图”。输入 @ 只会匹配当前标签页引用素材。';return `<div class="composer"><div class="prompt-area"><div class="prompt-wrap"><div class="prompt-highlight" id="hl-${k}">${highlightPrompt((drafts[k]!==undefined?drafts[k]:(tab.draft_prompt||'')),k)}</div><textarea class="prompt" id="input-${k}" style="height:${h}px" ${locked?'disabled':''} placeholder="${ph}" oninput="promptInput('${shot.shot_id}','${k}',this)" onkeyup="rememberPromptState('${k}',this,false);handleAtInput('${shot.shot_id}','${k}',this)" onclick="rememberPromptState('${k}',this,false);handleAtInput('${shot.shot_id}','${k}',this)" onmouseup="rememberPromptState('${k}',this,true)" onblur="rememberPromptState('${k}',this,true)" onwheel="handlePromptWheel(event,'${k}')" onscroll="rememberPromptState('${k}',this,false);syncHighlight('${k}');handleAtInput('${shot.shot_id}','${k}',this)" ondragover="${locked?'':'allowPromptDrop(event)'}" ondragleave="event.currentTarget.classList.remove('drag-over-prompt')" ondrop="${locked?'':'dropOnPrompt(event,\''+shot.shot_id+'\',\''+k+'\')'}" onpaste="${locked?'':'pasteImageToPrompt(event,\''+shot.shot_id+'\',\''+k+'\')'}">${esc(drafts[k]!==undefined?drafts[k]:(tab.draft_prompt||''))}</textarea></div>${redo?`<div class="desc">正在重做历史提示词，生成结果会追加到当前标签页末尾，旧图片和后续记录都会保留。</div>`:''}${base?`<div class="desc">当前将基于图片 ${esc(base.slice(-6))} 编辑。<button class="btn ghost small" ${locked?'disabled':''} onclick="clearBase('${k}')">取消</button></div>`:''}</div><div class="composer-actions"><button class="btn small" ${locked?'disabled':''} onclick="submitMessage('${shot.shot_id}','${k}')">发送</button></div><div class="suggest" id="suggest-${k}"></div></div>`}
 function renderStory(shot){const mode=storyViewMode[shot.shot_id]||'story';const active=mode==='notes';return `<div class="story"><div class="story-head"><div class="story-switch"><button class="tab-btn ${!active?'active':''}" onclick="storyViewMode['${shot.shot_id}']='story';renderScenes()">待选分镜</button><button class="tab-btn ${active?'active':''}" onclick="storyViewMode['${shot.shot_id}']='notes';renderScenes()">审核备注</button></div></div>${active?renderReviewNote(shot):renderStoryboardPanel(shot)}</div>`}
@@ -655,18 +662,67 @@ function positionSuggest(sg,ta,pos){try{const c=caretCoords(ta,Number.isFinite(p
 function insertAssetSuggestion(e,tabId,assetId){if(e){e.preventDefault();e.stopPropagation()}const a=assetById(assetId);if(!a){toast('素材不存在或已被删除');return}insertAt(tabId,a.name,a.asset_id)}
 function insertAt(tabId,name,assetId){const ta=$('input-'+tabId);if(!ta)return;const v=ta.value;let start=parseInt(ta.dataset.mentionStart||'-1',10);let end=parseInt(ta.dataset.mentionEnd||String(ta.selectionStart||0),10);if(start<0||start>v.length){const range=activeMentionRange(ta);if(range){start=range.start;end=range.end}else{start=ta.selectionStart||0;end=start}}name=String(name||'').replace(/^@+/,'');const insert='@'+name+' ';drafts[tabId]=v.slice(0,start)+insert+v.slice(end);if(assetId){const f=shotByTabId(tabId);const t=f?.tab||(f?.shot?.tabs||[]).find(x=>x.tab_id===tabId);if(t){t.referenced_assets=t.referenced_assets||[];if(!t.referenced_assets.includes(assetId))t.referenced_assets.push(assetId)}}const cursor=start+insert.length;const sg=$('suggest-'+tabId);if(sg){sg.classList.remove('open');sg.innerHTML=''}ta.value=drafts[tabId];ta.focus();ta.setSelectionRange(cursor,cursor);rememberPromptState(tabId,ta,false);saveProject();const st=capturePromptStates();st[tabId]={...(st[tabId]||{}),selectionStart:cursor,selectionEnd:cursor,scrollTop:ta.scrollTop||0,scrollLeft:ta.scrollLeft||0,height:ta.offsetHeight};st._active=tabId;const __vs=captureViewState();__vs.prompt=st;renderScenes(st);restoreViewState(__vs);setTimeout(()=>{const nt=$('input-'+tabId);if(nt){nt.focus();nt.setSelectionRange(cursor,cursor);const hl=$('hl-'+tabId);if(hl)hl.innerHTML=highlightPrompt(drafts[tabId]||'',tabId);syncHighlight(tabId)}restoreViewState(__vs)},30)}
 async function submitMessage(shotId,tabId){
+  if(!assertEditShot(shotId))return;
+  const msg0=(drafts[tabId]||'').trim();
+  const mode=(typeof isStartImageText==='function'&&isStartImageText(msg0))?'generate':'chat';
+  if(mode==='chat')return submitMessageCore(shotId,tabId); // 聊天保持原单条流程
+  // 生成：按「数量」批量 + 并发多任务，互不阻塞，各自实时计时。
   const f=(typeof shotById==='function')?shotById(shotId):null;
   const tb=f&&(f.shot.tabs||[]).find(t=>t.tab_id===tabId);
-  const msg0=(drafts[tabId]||'').trim();
-  const isGen=(typeof isStartImageText==='function')?isStartImageText(msg0):!!msg0;
-  let count=1;
-  if(isGen){let c=parseInt((tb&&tb.settings&&tb.settings.gen_count)||'1');count=Math.max(1,Math.min(8,isNaN(c)?1:c))}
-  if(count<=1)return submitMessageCore(shotId,tabId);
-  for(let i=0;i<count;i++){
-    if(typeof term==='function')term('批量生成 '+(i+1)+'/'+count+' …');
-    await submitMessageCore(shotId,tabId);
-    drafts[tabId]=msg0;const ft=(typeof findTabById==='function')?findTabById(tabId):null;if(ft&&ft.tab)ft.tab.draft_prompt=msg0;
+  let c=parseInt((tb&&tb.settings&&tb.settings.gen_count)||'1');const count=Math.max(1,Math.min(8,isNaN(c)?1:c));
+  const base=selectedBase[tabId]||null;const redoId=redoState[tabId]?.messageId||null;
+  try{await saveProject()}catch(e){term('保存失败：'+e.message);return}
+  // 清空草稿，便于马上输入下一条任务（不再等待上一条完成）。
+  drafts[tabId]='';const ft=findTabById(tabId);if(ft&&ft.tab)ft.tab.draft_prompt='';
+  delete selectedBase[tabId];delete redoState[tabId];
+  const ta=$('input-'+tabId);if(ta){ta.value='';const hl=$('hl-'+tabId);if(hl)hl.innerHTML=highlightPrompt('',tabId)}
+  for(let i=0;i<count;i++)launchGenTask(shotId,tabId,msg0,base,redoId);
+  renderScenes();
+}
+// 单条并发生成任务：非阻塞，完成后定向合并结果（不整体覆盖，避免并发互相丢图）。
+function launchGenTask(shotId,tabId,msg,base,redoId){
+  const taskId=uid('gen');
+  (genTasks[tabId]=genTasks[tabId]||[]).push({id:taskId,start:Date.now(),label:'正在生成图片…'});
+  const reqProject=currentProject;
+  (async()=>{
+    try{
+      const __gs=loadGlobalSettings();
+      const r=await api('/api/submit',{method:'POST',body:{project:reqProject,shot_id:shotId,tab_id:tabId,message:msg,mode:'generate',base_image_id:base||null,redo_message_id:redoId||null,api_key:(__gs.keys.openai_image||''),gemini_api_key:(__gs.keys.gemini_image||''),user_name:currentUserName}});
+      removeGenTask(tabId,taskId);
+      if(r&&r.usage)updateUsageUI(r.usage);
+      const vs=(typeof captureViewState==='function')?captureViewState():null;
+      if(currentProject!==reqProject){
+        notifyNewAsset('有新素材生成成功（已保存到原项目）');term('结果已保存到原项目');
+      }else{
+        mergeGenResult(r);notifyNewAsset('有新素材生成成功');term('生成完成');
+      }
+      renderScenes(vs?vs.prompt:undefined);if(vs)restoreViewState(vs);
+    }catch(e){
+      removeGenTask(tabId,taskId);
+      if(e&&e.usage)updateUsageUI(e.usage);
+      const vs=(typeof captureViewState==='function')?captureViewState():null;
+      toast(e.message||'生成失败');term('失败：'+(e.message||''));
+      renderScenes(vs?vs.prompt:undefined);if(vs)restoreViewState(vs);
+    }
+  })();
+}
+// 把单条生成结果定向并入当前视图：只追加这张新图 + 新消息（按 id 去重），不整体替换 project。
+function mergeGenResult(r){
+  if(!r)return;
+  const img=r.image;
+  if(!img){if(r.data)updateFromServer(r);return}
+  const loc=findTabById(img.tab_id);
+  if(!loc){updateFromServer(r);return}
+  loc.tab.generated_images=loc.tab.generated_images||[];
+  if(!loc.tab.generated_images.some(x=>x.image_id===img.image_id))loc.tab.generated_images.push(img);
+  loc.tab.current_base_image_id=img.image_id;
+  const remoteTab=findTabInData(r.data,img.tab_id);
+  if(remoteTab&&Array.isArray(remoteTab.messages)){
+    loc.tab.messages=loc.tab.messages||[];
+    const have=new Set(loc.tab.messages.map(m=>m&&m.message_id));
+    remoteTab.messages.forEach(m=>{if(m&&m.message_id&&!have.has(m.message_id)){loc.tab.messages.push(m);have.add(m.message_id)}});
   }
+  setSave('已保存');
 }
 async function submitMessageCore(shotId,tabId){if(!assertEditShot(shotId))return;const viewState=captureViewState();const msg=(drafts[tabId]||'').trim();const mode=isStartImageText(msg)?'generate':'chat';pendingState[tabId]=mode==='chat'?'正在与 GPT 聊天…':'正在生成图片…';renderScenes(viewState.prompt);restoreViewState(viewState);const base=selectedBase[tabId]||null;const redoId=redoState[tabId]?.messageId||null;const reqProject=currentProject;try{await saveProject();const __gs=loadGlobalSettings();const r=await api('/api/submit',{method:'POST',body:{project:reqProject,shot_id:shotId,tab_id:tabId,message:msg,mode,base_image_id:base,redo_message_id:redoId,api_key:(__gs.keys.openai_image||''),gemini_api_key:(__gs.keys.gemini_image||''),user_name:currentUserName}});delete pendingState[tabId];if(currentProject!==reqProject){if(mode!=='chat')notifyNewAsset('有新素材生成成功（已保存到原项目）');term('结果已保存到原项目');return}preservePromptDraftForTab(tabId,msg,r.data);delete selectedBase[tabId];delete redoState[tabId];updateFromServer(r,viewState);if(mode!=='chat')notifyNewAsset('有新素材生成成功');term(mode==='chat'?'聊天完成':'生成完成')}catch(e){delete pendingState[tabId];renderScenes(viewState.prompt);restoreViewState(viewState);toast(e.message);term('失败：'+e.message)}}
 function redoFromMessage(shotId,tabId,messageId){if(!assertEditShot(shotId))return;const f=shotById(shotId);const t=f.shot.tabs.find(x=>x.tab_id===tabId)||activeTab(f.shot);const msg=(t.messages||[]).find(m=>m.message_id===messageId);if(!msg)return;redoState[tabId]={messageId};drafts[tabId]=messageDisplayContent(msg);renderScenes()}

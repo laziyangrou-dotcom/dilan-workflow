@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import time
+import threading
 import uuid
 import urllib.request
 import urllib.error
@@ -876,6 +877,25 @@ def create_project_data(name, parent_id=None, scene_start=None, scene_end=None):
         "scenes": scenes,
     }
     return normalize_project(data, rename_dirs=False)
+
+
+_PROJECT_MUTATION_LOCKS = {}
+_PROJECT_MUTATION_LOCKS_GUARD = threading.Lock()
+
+
+def project_mutation_lock(pid):
+    """Per-project lock so concurrent generate/chat/save operations serialize
+    their read-modify-write of the project JSON. Without it, parallel image
+    generation tasks could lose each other's appended images (last-write-wins).
+    The slow model call stays OUTSIDE this lock so generations still run in
+    parallel; only the brief reload->append->save section is serialized."""
+    key = str(pid or "")
+    with _PROJECT_MUTATION_LOCKS_GUARD:
+        lk = _PROJECT_MUTATION_LOCKS.get(key)
+        if lk is None:
+            lk = threading.RLock()
+            _PROJECT_MUTATION_LOCKS[key] = lk
+    return lk
 
 
 def load_project(pid):
@@ -4507,8 +4527,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pid = safe_name(body.get("project") or body.get("project_id") or "project")
         data = body.get("data") or body
         data.pop("apiKey", None)
-        saved = save_project(pid, data)
-        append_operation_log(saved["project_id"], "project_save", user_name="系统", stats=project_stats(saved))
+        _lock = project_mutation_lock(pid)
+        _lock.acquire()
+        try:
+            saved = save_project(pid, data)
+            append_operation_log(saved["project_id"], "project_save", user_name="系统", stats=project_stats(saved))
+        finally:
+            _lock.release()
         self.send_json(200, {"ok": True, "data": saved, "project": project_meta(saved["project_id"])})
 
     def api_project_delete(self):
@@ -4934,26 +4959,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if mentioned_doc_assets:
                     reply += " 本次 @ 了文档：" + "、".join([a.get("name", "") for a in mentioned_doc_assets]) + "（mock 模式不读取文档内容，填入 API Key 后生效）。"
                 reply += "你可以继续补充画面需求；确认后输入“开始生图”。"
-            latest = load_project(pid)
-            scene2, shot2, tab2, user_msg_id = apply_user_message_for_submit(latest, shot.get("shot_id"), tab.get("tab_id"), user_text, redo_id)
-            tab2["draft_prompt"] = user_text
-            state = tab2.setdefault("responses_state", {})
-            state["model"] = GPT_RESPONSES_MODEL
-            state["search_mode"] = gpt_responses_search_mode(settings)
-            state["last_plan"] = reply
-            state["ready_to_generate"] = True
-            if response_id:
-                state["response_id"] = response_id
-            tab2.setdefault("messages", []).append({"message_id": new_id("msg"), "role": "assistant", "content": reply, "time": now_str(), "kind": "gpt_chat", "reply_to_message_id": user_msg_id})
-            update_context_summary(tab2, user_text)
-            usage = record_usage(user_name, "chat", GPT_RESPONSES_MODEL, tokens, pid, shot2.get("shot_id"), tab2.get("tab_id"), scene=scene2, shot=shot2) if tokens else get_user_usage(user_name)
-            append_operation_log(pid, "gpt_responses_chat", user_name=user_name, scene_code=scene2.get("scene_code"), shot_code=shot2.get("shot_code"), shot_id=shot2.get("shot_id"), tab_id=tab2.get("tab_id"), message=user_text, model=GPT_RESPONSES_MODEL)
-            save_project(pid, latest)
+            _lock = project_mutation_lock(pid)
+            _lock.acquire()
+            try:
+                latest = load_project(pid)
+                scene2, shot2, tab2, user_msg_id = apply_user_message_for_submit(latest, shot.get("shot_id"), tab.get("tab_id"), user_text, redo_id)
+                tab2["draft_prompt"] = user_text
+                state = tab2.setdefault("responses_state", {})
+                state["model"] = GPT_RESPONSES_MODEL
+                state["search_mode"] = gpt_responses_search_mode(settings)
+                state["last_plan"] = reply
+                state["ready_to_generate"] = True
+                if response_id:
+                    state["response_id"] = response_id
+                tab2.setdefault("messages", []).append({"message_id": new_id("msg"), "role": "assistant", "content": reply, "time": now_str(), "kind": "gpt_chat", "reply_to_message_id": user_msg_id})
+                update_context_summary(tab2, user_text)
+                usage = record_usage(user_name, "chat", GPT_RESPONSES_MODEL, tokens, pid, shot2.get("shot_id"), tab2.get("tab_id"), scene=scene2, shot=shot2) if tokens else get_user_usage(user_name)
+                append_operation_log(pid, "gpt_responses_chat", user_name=user_name, scene_code=scene2.get("scene_code"), shot_code=shot2.get("shot_code"), shot_id=shot2.get("shot_id"), tab_id=tab2.get("tab_id"), message=user_text, model=GPT_RESPONSES_MODEL)
+                save_project(pid, latest)
+            finally:
+                _lock.release()
             self.send_json(200, {"ok": True, "data": latest, "reply": reply, "used_mock": not bool(api_key), "mode": "chat", "usage": usage})
         except Exception as e:
             self.send_json(500, {"error": str(e), "data": load_project(pid), "usage": get_user_usage(user_name)})
 
     def _perform_gpt_responses_generate(self, pid, data, scene, shot, tab, user_text, api_key, explicit_mode, selected_base_id, user_name, redo_id="", gemini_api_key=""):
+        gen_t0 = time.monotonic()
         # V23：@素材 候选池改为全项目素材库（不再限于当前标签页引用素材）。
         tab_assets = [a for a in (data.get("assets") or []) if a and not a.get("temporary") and a.get("name")]
         settings = tab.get("settings") or data.get("project_settings") or project_default_settings(load_config()["global_defaults"])
@@ -5016,6 +5047,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             out = shot_dir / filename
             out.write_bytes(image_bytes)
             file_url = "/output/image/" + out.relative_to(OUTPUT_IMAGE_DIR).as_posix()
+            gen_seconds = round(time.monotonic() - gen_t0, 1)
             img = {
                 "image_id": new_id("img"), "file_path": file_url, "created_at": now_str(), "operation": operation,
                 "base_image_id": use_base_id if operation == "edit" else None, "user_message": user_text or latest_text,
@@ -5024,28 +5056,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "execution_sheet": execution_sheet,
                 "final_execution_mapping": execution_sheet.get("final_execution_mapping") or [],
                 "normalized_text": execution_sheet.get("normalized_text") or "",
+                "generation_seconds": gen_seconds,
             }
-            latest = load_project(pid)
-            scene2, shot2, tab2, user_msg_id = apply_user_message_for_submit(latest, shot.get("shot_id"), tab.get("tab_id"), user_text, redo_id)
-            tab2["draft_prompt"] = user_text
-            img["source_message_id"] = user_msg_id
-            tab2.setdefault("generated_images", []).append(img)
-            tab2["current_base_image_id"] = img["image_id"]
-            update_context_summary(tab2, latest_text)
-            state = tab2.setdefault("responses_state", {})
-            state["model"] = GPT_RESPONSES_MODEL
-            state["search_mode"] = gpt_responses_search_mode(settings)
-            state["last_plan"] = prompt
-            state["last_execution_sheet"] = execution_sheet
-            state["ready_to_generate"] = False
-            # V28: image generation is isolated; do not replace chat response_id with image response_id.
-            if image_call_id:
-                state["last_image_call_id"] = image_call_id
-            tab2.setdefault("messages", []).append({"message_id": new_id("msg"), "role": "assistant", "content": "gpt生图已生成 1 张图片。", "time": now_str(), "operation": operation, "kind": "gpt_generate", "image_id": img["image_id"], "reply_to_message_id": user_msg_id})
-            usage = record_usage(user_name, "image", GPT_RESPONSES_MODEL + "/" + model, tokens, pid, shot2.get("shot_id"), tab2.get("tab_id"), scene=scene2, shot=shot2) if tokens else get_user_usage(user_name)
-            append_operation_log(pid, "gpt_responses_image_success", user_name=user_name, scene_code=scene2.get("scene_code"), shot_code=shot2.get("shot_code"), shot_id=shot2.get("shot_id"), tab_id=tab2.get("tab_id"), prompt=latest_text, output_path=img.get("file_path"), image_id=img.get("image_id"), operation=operation, model=GPT_RESPONSES_MODEL)
-            create_project_snapshot(pid, "gpt_responses_image_success", data=latest, user_name=user_name)
-            save_project(pid, latest)
+            _lock = project_mutation_lock(pid)
+            _lock.acquire()
+            try:
+                latest = load_project(pid)
+                scene2, shot2, tab2, user_msg_id = apply_user_message_for_submit(latest, shot.get("shot_id"), tab.get("tab_id"), user_text, redo_id)
+                tab2["draft_prompt"] = user_text
+                img["source_message_id"] = user_msg_id
+                tab2.setdefault("generated_images", []).append(img)
+                tab2["current_base_image_id"] = img["image_id"]
+                update_context_summary(tab2, latest_text)
+                state = tab2.setdefault("responses_state", {})
+                state["model"] = GPT_RESPONSES_MODEL
+                state["search_mode"] = gpt_responses_search_mode(settings)
+                state["last_plan"] = prompt
+                state["last_execution_sheet"] = execution_sheet
+                state["ready_to_generate"] = False
+                # V28: image generation is isolated; do not replace chat response_id with image response_id.
+                if image_call_id:
+                    state["last_image_call_id"] = image_call_id
+                tab2.setdefault("messages", []).append({"message_id": new_id("msg"), "role": "assistant", "content": "gpt生图已生成 1 张图片。", "time": now_str(), "operation": operation, "kind": "gpt_generate", "image_id": img["image_id"], "reply_to_message_id": user_msg_id})
+                usage = record_usage(user_name, "image", GPT_RESPONSES_MODEL + "/" + model, tokens, pid, shot2.get("shot_id"), tab2.get("tab_id"), scene=scene2, shot=shot2) if tokens else get_user_usage(user_name)
+                append_operation_log(pid, "gpt_responses_image_success", user_name=user_name, scene_code=scene2.get("scene_code"), shot_code=shot2.get("shot_code"), shot_id=shot2.get("shot_id"), tab_id=tab2.get("tab_id"), prompt=latest_text, output_path=img.get("file_path"), image_id=img.get("image_id"), operation=operation, model=GPT_RESPONSES_MODEL)
+                create_project_snapshot(pid, "gpt_responses_image_success", data=latest, user_name=user_name)
+                save_project(pid, latest)
+            finally:
+                _lock.release()
             self.send_json(200, {"ok": True, "data": latest, "image": img, "used_mock": not bool(api_key), "mode": "generate", "usage": usage})
         except Exception as e:
             self.send_json(500, {"error": str(e), "data": load_project(pid), "usage": get_user_usage(user_name)})
