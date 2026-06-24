@@ -672,10 +672,8 @@ async function submitMessage(shotId,tabId){
   let c=parseInt((tb&&tb.settings&&tb.settings.gen_count)||'1');const count=Math.max(1,Math.min(8,isNaN(c)?1:c));
   const base=selectedBase[tabId]||null;const redoId=redoState[tabId]?.messageId||null;
   try{await saveProject()}catch(e){term('保存失败：'+e.message);return}
-  // 清空草稿，便于马上输入下一条任务（不再等待上一条完成）。
-  drafts[tabId]='';const ft=findTabById(tabId);if(ft&&ft.tab)ft.tab.draft_prompt='';
+  // 需求1：提交任务后保留提示词，便于基于同一条提示词继续微调或重复提交，不清空草稿。
   delete selectedBase[tabId];delete redoState[tabId];
-  const ta=$('input-'+tabId);if(ta){ta.value='';const hl=$('hl-'+tabId);if(hl)hl.innerHTML=highlightPrompt('',tabId)}
   for(let i=0;i<count;i++)launchGenTask(shotId,tabId,msg0,base,redoId);
   renderScenes();
 }

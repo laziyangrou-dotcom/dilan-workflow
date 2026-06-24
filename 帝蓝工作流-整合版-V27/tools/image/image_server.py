@@ -337,6 +337,21 @@ def safe_file_name(name: str, fallback: str = "file") -> str:
     return s[:120] or fallback
 
 
+def safe_replace_file(src: Path, dst: Path):
+    """跨平台“改名/覆盖”：等价于改名，但目标已存在时原子覆盖而非报错。
+
+    Windows 下 Path.rename / os.rename 在目标已存在时会抛 WinError 183
+    （“当文件已存在时，无法创建该文件”），导致素材改名失败并可能残留孤儿文件，
+    下次再改成同名时又触发 183。改用 os.replace：目标已存在则原子覆盖。
+    调用方已用 asset_name_exists 保证素材名全局唯一，dst 若存在必是上次失败
+    残留的孤儿文件，覆盖是安全的。
+    """
+    if src == dst:
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(str(src), str(dst))
+
+
 def parse_positive_int(value, default=None):
     """Parse a positive integer from user input. Returns default when empty/invalid."""
     text = str(value or "").strip()
@@ -4675,18 +4690,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if asset_name_exists(data, new_name, asset_id):
             self.send_json(400, {"error": "素材名已存在，素材名需要全局唯一"}); return
         fp = public_to_local(target.get("file_path"))
+        rollback_pair = None  # (新文件, 旧文件)：磁盘已改名但落库失败时回滚，避免图片丢失
         if fp and fp.exists():
             final_name = new_name
             new_fp = fp.with_name(final_name + fp.suffix)
             if new_fp != fp:
-                fp.rename(new_fp)
+                safe_replace_file(fp, new_fp)
+                rollback_pair = (new_fp, fp)
             rel = new_fp.relative_to(INPUT_DIR).as_posix()
             target["file_path"] = "/input/" + rel
             target["name"] = new_fp.stem
         else:
             target["name"] = new_name
-        mention_updates = replace_at_mentions_in_project(data, old_asset_name, target.get("name"))
-        save_project(pid, data)
+        try:
+            mention_updates = replace_at_mentions_in_project(data, old_asset_name, target.get("name"))
+            save_project(pid, data)
+        except Exception:
+            if rollback_pair is not None:
+                _new_fp, _old_fp = rollback_pair
+                if _new_fp.exists() and not _old_fp.exists():
+                    try:
+                        os.replace(str(_new_fp), str(_old_fp))
+                    except Exception:
+                        pass
+            raise
         self.send_json(200, {"ok": True, "data": data, "asset": target, "old_name": old_asset_name, "new_name": target.get("name"), "mention_updates": mention_updates})
 
     def api_asset_move(self):
@@ -4725,7 +4752,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ext = old_fp.suffix if old_fp and old_fp.exists() else ".png"
             new_fp = out_dir / f"{new_name}{ext}"
             if old_fp and old_fp.exists():
-                old_fp.rename(new_fp)
+                safe_replace_file(old_fp, new_fp)
                 rel = new_fp.relative_to(INPUT_DIR).as_posix()
                 a["file_path"] = "/input/" + rel
             a["name"] = new_name
