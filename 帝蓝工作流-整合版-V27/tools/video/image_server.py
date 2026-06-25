@@ -3705,12 +3705,256 @@ def download_video_to_project(url: str, out_dir: Path, resolution="", ratio=""):
     return out
 
 
-def seedance_content_from_prompt(prompt: str, data: dict, tab: dict):
+# =========================================================================
+# 火山 TOS（对象存储）支持：为 Seedance 2.0 参考视频提供公网可访问 URL。
+#
+# 设计原则（见开发文档）：
+#   - 长期资产只存 asset["remote"] = {provider/bucket/key/sha256/size/...}；
+#     预签名 URL 只是“临时门票”，每次调用前用 bucket+key 重新生成，绝不长期保存。
+#   - 本地文件始终保留，TOS 对象丢失时可从本地重传。
+#   - AK/SK 只从环境变量读取，绝不写入项目 JSON。
+#   - tos SDK 懒加载：未启用 TOS（tos_enabled=false）或未安装 SDK 时，本模块
+#     不会 import tos，现有图片/音频/普通视频流程完全不受影响。
+# =========================================================================
+
+def is_http_url(url: str) -> bool:
+    u = str(url or "").strip().lower()
+    return u.startswith("http://") or u.startswith("https://")
+
+
+def is_data_url(url: str) -> bool:
+    return str(url or "").strip().lower().startswith("data:")
+
+
+def is_video_asset(asset: dict) -> bool:
+    return str((asset or {}).get("category") or "") == "视频"
+
+
+def is_audio_asset(asset: dict) -> bool:
+    return str((asset or {}).get("category") or "") == "音频"
+
+
+def get_tos_settings():
+    """从 config.json 的 global_defaults + 环境变量读取 TOS 配置。AK/SK 只来自环境变量。"""
+    cfg = load_config()
+    g = cfg.get("global_defaults") or {}
+    ak = os.environ.get("VOLC_TOS_ACCESS_KEY_ID") or os.environ.get("TOS_ACCESS_KEY_ID") or ""
+    sk = os.environ.get("VOLC_TOS_SECRET_ACCESS_KEY") or os.environ.get("TOS_SECRET_ACCESS_KEY") or ""
+    prefix = str(g.get("tos_prefix") or "dilan-workflow/video-module/").strip().strip("/")
+    return {
+        "enabled": bool(g.get("tos_enabled")),
+        "bucket": str(g.get("tos_bucket") or "").strip(),
+        "region": str(g.get("tos_region") or "cn-beijing").strip(),
+        "endpoint": str(g.get("tos_endpoint") or "https://tos-cn-beijing.volces.com").strip(),
+        "prefix": (prefix + "/") if prefix else "",
+        "presign_expire_seconds": int(g.get("tos_presign_expire_seconds") or 86400),
+        "refresh_margin_seconds": int(g.get("tos_presign_refresh_margin_seconds") or 600),
+        "upload_generated_videos": bool(g.get("tos_upload_generated_videos", True)),
+        "ak": ak,
+        "sk": sk,
+    }
+
+
+_TOS_CLIENT_CACHE = {}
+_TOS_CLIENT_GUARD = threading.Lock()
+
+
+def get_tos_client():
+    """返回缓存的 TosClientV2。未启用/缺配置/缺 SDK 时抛出可读中文错误。"""
+    s = get_tos_settings()
+    if not s["enabled"]:
+        raise RuntimeError("TOS 未启用：请在视频模块 config.json 的 global_defaults 中设置 tos_enabled=true。")
+    if not s["bucket"]:
+        raise RuntimeError("TOS bucket 未配置，请在视频模块 config.json 中填写 tos_bucket。")
+    if not s["ak"] or not s["sk"]:
+        raise RuntimeError("TOS AK/SK 未配置，请设置环境变量 VOLC_TOS_ACCESS_KEY_ID 和 VOLC_TOS_SECRET_ACCESS_KEY。")
+    cache_key = (s["ak"], s["sk"], s["endpoint"], s["region"])
+    with _TOS_CLIENT_GUARD:
+        client = _TOS_CLIENT_CACHE.get(cache_key)
+        if client is not None:
+            return client
+        try:
+            import tos
+        except Exception as e:
+            raise RuntimeError("缺少火山 TOS Python SDK，请先在视频模块安装依赖：pip install tos") from e
+        try:
+            client = tos.TosClientV2(s["ak"], s["sk"], s["endpoint"], s["region"])
+        except Exception as e:
+            raise RuntimeError(f"初始化 TOS 客户端失败：{e}") from e
+        _TOS_CLIENT_CACHE[cache_key] = client
+        return client
+
+
+def build_tos_object_key(pid: str, asset: dict, fp: Path, file_sha256: str = "") -> str:
+    """参考素材的对象 key：稳定、无中文、随 sha256 变化。"""
+    s = get_tos_settings()
+    suffix = (fp.suffix or "").lower() or ".mp4"
+    asset_id = safe_name(asset.get("asset_id") or new_id("asset"))
+    project_id = safe_name(pid or "unknown_project")
+    digest = (file_sha256 or "")[:16] or "nohash"
+    return f"{s['prefix']}projects/{project_id}/assets/{asset_id}_{digest}{suffix}"
+
+
+def build_tos_generated_video_key(pid: str, video_id: str, fp: Path, file_sha256: str = "") -> str:
+    """生成结果视频的对象 key。"""
+    s = get_tos_settings()
+    suffix = (fp.suffix or "").lower() or ".mp4"
+    project_id = safe_name(pid or "unknown_project")
+    vid = safe_name(video_id or new_id("vid"))
+    digest = (file_sha256 or "")[:16] or "nohash"
+    return f"{s['prefix']}projects/{project_id}/generated/{vid}_{digest}{suffix}"
+
+
+def upload_file_to_tos(fp: Path, key: str, content_type: str = "") -> dict:
+    """上传本地文件到 TOS，返回 remote 元数据。兼容不同 SDK 版本的上传方法。"""
+    if not fp or not fp.exists() or not fp.is_file():
+        raise RuntimeError(f"待上传文件不存在：{fp}")
+    s = get_tos_settings()
+    client = get_tos_client()
+    bucket = s["bucket"]
+    mime = content_type or mimetypes.guess_type(str(fp))[0] or "application/octet-stream"
+    try:
+        if hasattr(client, "put_object_from_file"):
+            client.put_object_from_file(bucket, key, str(fp))
+        else:
+            with open(fp, "rb") as f:
+                client.put_object(bucket, key, content=f.read())
+    except Exception as e:
+        raise RuntimeError(f"TOS 上传失败：{fp.name} -> {key}，原因：{e}") from e
+    return {
+        "provider": "tos",
+        "bucket": bucket,
+        "key": key,
+        "region": s["region"],
+        "endpoint": s["endpoint"],
+        "content_type": mime,
+        "size": fp.stat().st_size,
+        "uploaded_at": now_str(),
+        "status": "uploaded",
+    }
+
+
+def tos_object_exists(bucket: str, key: str) -> bool:
+    """用 head_object 检查对象是否存在；SDK 无该方法时不强制检查（认为存在）。"""
+    try:
+        client = get_tos_client()
+    except Exception:
+        return False
+    try:
+        if hasattr(client, "head_object"):
+            client.head_object(bucket, key)
+            return True
+        return True
+    except Exception:
+        return False
+
+
+def generate_tos_presigned_get_url(bucket: str, key: str, expires: int = None) -> str:
+    """生成 GET 预签名 URL。不同 tos SDK 版本的方法名/参数/返回值不同，这里做多重兜底。"""
+    s = get_tos_settings()
+    client = get_tos_client()
+    expires = int(expires or s["presign_expire_seconds"])
+    try:
+        import tos
+    except Exception as e:
+        raise RuntimeError("缺少火山 TOS Python SDK，请先安装：pip install tos") from e
+    # GET 方法的枚举/字面量在不同版本里可能不同，逐一兜底。
+    method_get = "GET"
+    http_enum = getattr(tos, "HttpMethodType", None)
+    if http_enum is not None:
+        method_get = (getattr(http_enum, "Http_Method_Get", None)
+                      or getattr(http_enum, "HTTP_METHOD_GET", None)
+                      or method_get)
+    result = None
+    last_exc = None
+    if hasattr(client, "pre_signed_url"):
+        for attempt in (
+            lambda: client.pre_signed_url(method_get, bucket, key, expires),
+            lambda: client.pre_signed_url(http_method=method_get, bucket=bucket, key=key, expires=expires),
+            lambda: client.pre_signed_url(method=method_get, bucket=bucket, key=key, expires=expires),
+        ):
+            try:
+                result = attempt()
+                break
+            except TypeError as te:
+                last_exc = te
+                continue
+            except Exception as e:
+                raise RuntimeError(f"TOS 预签名 URL 生成失败：{key}，原因：{e}") from e
+    if result is None:
+        raise RuntimeError(
+            "当前 TOS SDK 未找到匹配的 pre_signed_url 调用方式，"
+            f"请确认 tos SDK 版本（最后一次参数异常：{last_exc}）。"
+        )
+    if isinstance(result, str):
+        return result
+    for attr in ("signed_url", "presigned_url", "url"):
+        v = getattr(result, attr, None)
+        if isinstance(v, str) and v:
+            return v
+    if isinstance(result, dict):
+        for k in ("signed_url", "presigned_url", "url"):
+            if isinstance(result.get(k), str) and result[k]:
+                return result[k]
+    raise RuntimeError(f"TOS 预签名 URL 返回值无法解析为字符串：{type(result)}")
+
+
+def ensure_asset_remote_url(pid: str, asset: dict, require_video: bool = False) -> str:
+    """返回可直接给 Seedance 使用的公网 http(s) URL（绝不返回 data: 或本地路径）。
+
+    需要时把本地文件上传到 TOS，并就地更新 asset["remote"]；
+    调用方在之后必须 save_project(pid, data) 才能持久化新写入的 remote 元数据。
+    """
+    if not asset:
+        raise RuntimeError("空素材，无法生成远程 URL。")
+    name = asset.get("name") or asset.get("asset_id") or "未命名素材"
+    # 1. 素材本身已是公网 URL（例如手动填写的 URL 素材）：直接用。
+    for field in ("remote_url", "url", "file_path"):
+        v = str(asset.get(field) or "").strip()
+        if is_http_url(v):
+            return v
+    # 2. 已有 TOS remote 元数据：用 bucket+key 重新生成预签名 URL；对象不在则尝试本地补传。
+    remote = asset.get("remote") if isinstance(asset.get("remote"), dict) else {}
+    bucket = remote.get("bucket")
+    key = remote.get("key")
+    if remote.get("provider") == "tos" and bucket and key:
+        if not tos_object_exists(bucket, key):
+            fp = public_to_local(asset.get("file_path"))
+            if fp and fp.exists() and fp.is_file():
+                file_sha = sha256_file(fp)
+                meta = upload_file_to_tos(fp, key, mimetypes.guess_type(str(fp))[0] or "")
+                meta["sha256"] = file_sha
+                remote.update(meta)
+                asset["remote"] = remote
+            else:
+                raise RuntimeError(f"参考视频素材“{name}”已丢失：本地文件不存在，TOS 对象也不存在。请重新上传该素材。")
+        return generate_tos_presigned_get_url(bucket, key)
+    # 3. 尚未上传过：把本地文件上传到 TOS。
+    fp = public_to_local(asset.get("file_path"))
+    if not fp or not fp.exists() or not fp.is_file():
+        raise RuntimeError(f"参考素材“{name}”没有可用的公网 URL，且本地文件不存在。请重新上传该素材，或为其填写公网 URL。")
+    if require_video:
+        if not get_tos_settings()["enabled"]:
+            raise RuntimeError("当前引用了本地视频素材，但 Seedance 2.0 参考视频必须使用公网 URL。"
+                               "请在视频模块 config.json 启用 TOS（tos_enabled=true）并配置 tos_bucket，或为该视频素材填写公网 URL。")
+        mime = mimetypes.guess_type(str(fp))[0] or ""
+        if mime and not mime.startswith("video/"):
+            raise RuntimeError(f"素材“{name}”不是视频文件，不能作为 Seedance 参考视频。")
+    file_sha = sha256_file(fp)
+    key = build_tos_object_key(pid, asset, fp, file_sha)
+    meta = upload_file_to_tos(fp, key, mimetypes.guess_type(str(fp))[0] or "")
+    meta["sha256"] = file_sha
+    asset["remote"] = meta
+    return generate_tos_presigned_get_url(meta["bucket"], meta["key"])
+
+
+def seedance_content_from_prompt(prompt: str, data: dict, tab: dict, pid: str = ""):
     content = [{"type": "text", "text": prompt or ""}]
     # V24：@素材 候选池改为全项目素材库（不再限于当前标签页引用素材），与美术/分镜一致。
     allowed_assets = [a for a in (data.get("assets") or []) if a and not a.get("temporary") and a.get("name")]
     aliases = referenced_aliases(prompt, data, allowed_assets)
     assets_by_name = {str(a.get("name", "")).lower(): a for a in allowed_assets}
+    video_count = 0
     for alias in aliases:
         asset = assets_by_name.get(str(alias).lower())
         if not asset:
@@ -3720,13 +3964,24 @@ def seedance_content_from_prompt(prompt: str, data: dict, tab: dict):
         fp = public_to_local(asset.get("file_path"))
         url = asset.get("file_path") or ""
         cat = asset.get("category") or ""
-        if fp and fp.exists():
-            url = local_to_data_url(fp)
-        if cat == "音频":
-            content.append({"type": "audio_url", "audio_url": {"url": url}, "role": "reference_audio"})
-        elif cat == "视频":
+        if cat == "视频":
+            # 视频参考素材：Seedance 2.0 只收公网 URL，自动上传 TOS 后用预签名 URL。
+            video_count += 1
+            if video_count > 3:
+                raise ValueError("Seedance 参考视频最多 3 个，请减少 prompt 中 @ 引用的视频素材数量。")
+            url = ensure_asset_remote_url(pid, asset, require_video=True)
+            if not is_http_url(url):
+                raise ValueError(f"参考视频“{asset.get('name')}”未能生成公网 URL，请检查 TOS 配置。")
             content.append({"type": "video_url", "video_url": {"url": url}, "role": "reference_video"})
+        elif cat == "音频":
+            # 音频 V1 暂保持原 data: 逻辑；若 Ark 后续拒收 data audio，再同样云端化。
+            if fp and fp.exists():
+                url = local_to_data_url(fp)
+            content.append({"type": "audio_url", "audio_url": {"url": url}, "role": "reference_audio"})
         else:
+            # 图片 V1 不强制改，继续走 data: base64。
+            if fp and fp.exists():
+                url = local_to_data_url(fp)
             content.append({"type": "image_url", "image_url": {"url": url}, "role": "reference_image"})
     return content
 
@@ -3762,7 +4017,7 @@ def sanitize_payload_for_record(payload):
     return slim
 
 
-def seedance_payload(prompt: str, settings: dict, data: dict, tab: dict):
+def seedance_payload(prompt: str, settings: dict, data: dict, tab: dict, pid: str = ""):
     duration = parse_positive_int(settings.get("video_duration"), 8) or 8
     model = normalize_video_model(settings.get("video_model") or DEFAULT_VIDEO_MODEL)
     if model == FAST_VIDEO_MODEL and str(settings.get("video_resolution") or "").lower() == "1080p":
@@ -3770,7 +4025,7 @@ def seedance_payload(prompt: str, settings: dict, data: dict, tab: dict):
         settings["video_resolution"] = "720p"
     payload = {
         "model": model,
-        "content": seedance_content_from_prompt(prompt, data, tab),
+        "content": seedance_content_from_prompt(prompt, data, tab, pid),
         "ratio": settings.get("video_ratio") or "16:9",
         "resolution": settings.get("video_resolution") or "720p",
         "duration": duration,
@@ -4860,20 +5115,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not api_key:
             self.send_json(400, {"error": "请先填写火山方舟 Ark API Key", "error_cn": "请先在右上角填写火山方舟 Ark API Key。"}); return
         try:
-            data = load_project(pid)
-            scene, shot, tab = find_tab(data, shot_id, tab_id)
-            debug_context.update({
-                "scene_code": scene.get("scene_code"),
-                "shot_code": shot.get("shot_code"),
-                "tab_name": tab.get("tab_name"),
-                "referenced_assets_before_submit": tab.get("referenced_assets") or [],
-                "asset_count": len(data.get("assets") or []),
-            })
-            settings = {**project_default_settings(load_config()["global_defaults"]), **(tab.get("settings") or {})}
-            if normalize_video_model(settings.get("video_model")) == FAST_VIDEO_MODEL and str(settings.get("video_resolution") or "").lower() == "1080p":
-                settings["video_resolution"] = "720p"
-            cost_details = estimate_seedance_cost(user_text, settings, data)
-            payload = seedance_payload(user_text, settings, data, tab)
+            # payload 构建会触发视频参考素材上传 TOS 并写入 asset["remote"]，因此在同一把
+            # 项目级锁内完成「读取项目 -> 构建 payload -> 持久化 remote」，避免与并发视频任务
+            # 互相覆盖；慢上传仅首次发生一次，Seedance 轮询仍在锁外不阻塞并发。
+            _build_lock = project_mutation_lock(pid)
+            _build_lock.acquire()
+            try:
+                data = load_project(pid)
+                scene, shot, tab = find_tab(data, shot_id, tab_id)
+                debug_context.update({
+                    "scene_code": scene.get("scene_code"),
+                    "shot_code": shot.get("shot_code"),
+                    "tab_name": tab.get("tab_name"),
+                    "referenced_assets_before_submit": tab.get("referenced_assets") or [],
+                    "asset_count": len(data.get("assets") or []),
+                })
+                settings = {**project_default_settings(load_config()["global_defaults"]), **(tab.get("settings") or {})}
+                if normalize_video_model(settings.get("video_model")) == FAST_VIDEO_MODEL and str(settings.get("video_resolution") or "").lower() == "1080p":
+                    settings["video_resolution"] = "720p"
+                cost_details = estimate_seedance_cost(user_text, settings, data)
+                payload = seedance_payload(user_text, settings, data, tab, pid)
+                save_project(pid, data)
+            finally:
+                _build_lock.release()
             debug_context["settings"] = sanitize_for_log(settings)
             debug_context["cost_details"] = sanitize_for_log(cost_details)
             started_at = now_str()
@@ -4944,6 +5208,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "generation_seconds": gen_seconds,
                 }
                 vid["video_id"] = vid["image_id"]
+                # 任务11：生成结果视频自动转存 TOS，便于日后再次作为参考视频
+                # （Ark 原始 remote_url 可能短期过期；本地文件 + TOS remote 双保险）。失败不影响本次生成。
+                try:
+                    _tos = get_tos_settings()
+                    if _tos.get("enabled") and _tos.get("upload_generated_videos"):
+                        _sha = sha256_file(out)
+                        _key = build_tos_generated_video_key(pid, vid["image_id"], out, _sha)
+                        _meta = upload_file_to_tos(out, _key, mimetypes.guess_type(str(out))[0] or "video/mp4")
+                        _meta["sha256"] = _sha
+                        vid["remote"] = _meta
+                except Exception as _tos_exc:
+                    vid["remote_upload_error"] = str(_tos_exc)
+                    print("生成视频转存 TOS 失败：", _tos_exc, flush=True)
                 tab2.setdefault("generated_images", []).append(vid)
                 tab2["generated_videos"] = tab2.get("generated_images", [])
                 tab2["current_base_image_id"] = vid["image_id"]

@@ -1,2 +1,7 @@
-# No third-party dependencies are required in this edition.
-# The backend uses only Python standard library.
+# 视频模块依赖：火山引擎 TOS 对象存储 SDK。
+# 用途：把本地“参考视频”素材上传到 TOS，再以预签名 URL 提供给 Seedance 2.0
+#       （Seedance 2.0 的 reference_video 必须是公网可访问 URL，不接受本地路径或 data: base64）。
+# 安装：pip install tos
+# 说明：未在 config.json 启用 TOS（tos_enabled=false）时，后端不会 import tos，
+#       现有图片 / 音频 / 普通视频生成流程无需联网安装也能正常运行。
+tos
