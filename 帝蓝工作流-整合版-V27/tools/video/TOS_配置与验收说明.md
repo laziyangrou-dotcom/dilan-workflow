@@ -1,4 +1,4 @@
-# Seedance 2.0 参考视频 · 火山 TOS 配置与验收说明（V30）
+# Seedance 2.0 参考视频 · 火山 TOS 配置与验收说明（V31）
 
 本说明配合「为视频模块 Seedance 2.0 增加引用视频素材（云端 URL）」功能。
 Seedance 2.0 的参考视频（`reference_video`）只接受**公网可访问的 URL**，不接受本地路径，
