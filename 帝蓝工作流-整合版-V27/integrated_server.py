@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-帝蓝工作流整合版 V31
+帝蓝工作流整合版 V32
 - 统一入口： http://127.0.0.1:8787/material、/image 或 /video
 - 素材、图片、视频工具作为三个独立子服务运行，核心代码互不合并。
 """
@@ -150,8 +150,17 @@ def sniff_import_package_module(body: bytes) -> str:
         return ""
 
 
+def set_user_env_var_windows(name: str, value: str):
+    """在 Windows「用户变量」区写入环境变量（setx，写入注册表持久化）。
+    注意：setx 只对之后新建的进程生效；已运行的网关与子服务必须重启后才会读到新值。"""
+    completed = subprocess.run(["setx", name, value], capture_output=True, text=True)
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip() or f"setx 返回码 {completed.returncode}"
+        raise RuntimeError(detail)
+
+
 class GatewayHandler(http.server.BaseHTTPRequestHandler):
-    server_version = "DilanIntegratedV31/1.0"
+    server_version = "DilanIntegratedV32/1.0"
 
     def log_message(self, fmt, *args):
         print("[gateway]", self.address_string(), "-", fmt % args)
@@ -164,6 +173,58 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Expires", "0")
         self.send_header("Content-Length", "0")
         self.end_headers()
+
+    def send_json(self, code: int, obj: dict):
+        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def handle_env_status(self):
+        """报告网关进程当前是否已读到 TOS 用户环境变量（反映重启后的“生效”状态）。"""
+        self.send_json(200, {
+            "ak_set": bool(os.environ.get("VOLC_TOS_ACCESS_KEY_ID") or os.environ.get("TOS_ACCESS_KEY_ID")),
+            "sk_set": bool(os.environ.get("VOLC_TOS_SECRET_ACCESS_KEY") or os.environ.get("TOS_SECRET_ACCESS_KEY")),
+            "platform": os.name,
+        })
+
+    def handle_set_tos_credentials(self):
+        """把前端填写的 AK/SK 写入 Windows 用户环境变量（setx）。不回显、不落盘到任何文件。"""
+        length = int(self.headers.get("Content-Length") or "0")
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            body = json.loads(raw.decode("utf-8") or "{}")
+        except Exception:
+            body = {}
+        ak = str(body.get("ak") or body.get("access_key_id") or "").strip()
+        sk = str(body.get("sk") or body.get("secret_access_key") or "").strip()
+        if not ak and not sk:
+            self.send_json(400, {"error": "未填写 Access Key ID / Secret Access Key。"})
+            return
+        if os.name != "nt":
+            self.send_json(400, {"error": "自动写入环境变量当前仅支持 Windows。请在系统中手动设置 VOLC_TOS_ACCESS_KEY_ID / VOLC_TOS_SECRET_ACCESS_KEY。"})
+            return
+        written = []
+        try:
+            if ak:
+                set_user_env_var_windows("VOLC_TOS_ACCESS_KEY_ID", ak)
+                written.append("VOLC_TOS_ACCESS_KEY_ID")
+            if sk:
+                set_user_env_var_windows("VOLC_TOS_SECRET_ACCESS_KEY", sk)
+                written.append("VOLC_TOS_SECRET_ACCESS_KEY")
+        except Exception as e:
+            self.send_json(500, {"error": f"写入用户环境变量失败：{e}"})
+            return
+        print(f"[gateway] 已写入用户环境变量：{'、'.join(written)}（需重启程序后生效）")
+        self.send_json(200, {
+            "ok": True,
+            "written": written,
+            "restart_required": True,
+            "message": "AK/SK 已写入 Windows 用户环境变量。请完全关闭本程序窗口后重新双击 start.bat，新设置才会生效。",
+        })
 
     def do_GET(self):
         self.handle_any()
@@ -181,6 +242,17 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
 
         if raw_path in ("/", ""):
             self.redirect("/material")
+            return
+
+        # 系统级接口由网关直接处理（不按 Referer 代理到子模块）：写 TOS 用户环境变量 / 查询状态。
+        if raw_path == "/api/system/set_tos_credentials":
+            if self.command.upper() == "POST":
+                self.handle_set_tos_credentials()
+            else:
+                self.send_error(405, "method not allowed")
+            return
+        if raw_path == "/api/system/env_status":
+            self.handle_env_status()
             return
 
         tool = None
@@ -294,7 +366,7 @@ def handle_exit_signal(signum, frame):
 
 def main():
     print("============================================")
-    print("帝蓝工作流整合版 V31")
+    print("帝蓝工作流整合版 V32")
     print("统一入口: http://127.0.0.1:%s/material" % GATEWAY_PORT)
     print("素材子服务: http://127.0.0.1:%s" % MATERIAL_PORT)
     print("图片子服务: http://127.0.0.1:%s" % IMAGE_PORT)
