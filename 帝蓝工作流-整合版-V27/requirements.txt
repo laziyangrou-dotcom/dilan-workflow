@@ -1,2 +1,6 @@
-# No third-party dependencies are required.
-# The integrated launcher and both tools use only the Python standard library.
+# 集成启动器与各工具默认仅使用 Python 标准库。
+# 视频模块「Seedance 2.0 参考视频」功能需要火山引擎 TOS 对象存储 SDK
+# （把本地参考视频上传 TOS，再以预签名 URL 提供给 Seedance）。
+# 安装.bat 会据此把 tos 装进 .venv；未在 tools/video/config.json 启用 TOS
+# （tos_enabled=false，默认）时代码不会 import tos，装上也不影响其它流程。
+tos
