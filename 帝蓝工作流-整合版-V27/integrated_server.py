@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-帝蓝工作流整合版 V27
+帝蓝工作流整合版 V29
 - 统一入口： http://127.0.0.1:8787/material、/image 或 /video
 - 素材、图片、视频工具作为三个独立子服务运行，核心代码互不合并。
 """
@@ -151,7 +151,7 @@ def sniff_import_package_module(body: bytes) -> str:
 
 
 class GatewayHandler(http.server.BaseHTTPRequestHandler):
-    server_version = "DilanIntegratedV27/1.0"
+    server_version = "DilanIntegratedV29/1.0"
 
     def log_message(self, fmt, *args):
         print("[gateway]", self.address_string(), "-", fmt % args)
@@ -294,7 +294,7 @@ def handle_exit_signal(signum, frame):
 
 def main():
     print("============================================")
-    print("帝蓝工作流整合版 V27")
+    print("帝蓝工作流整合版 V29")
     print("统一入口: http://127.0.0.1:%s/material" % GATEWAY_PORT)
     print("素材子服务: http://127.0.0.1:%s" % MATERIAL_PORT)
     print("图片子服务: http://127.0.0.1:%s" % IMAGE_PORT)
