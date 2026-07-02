@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-帝蓝工作流-数据中心-V36
+帝蓝工作流-数据中心-V37
 =====================
 局域网内统一的项目仓库服务端。制作端 / 审核端通过局域网地址访问，
 把原来靠本地压缩包手动传来传去的流程，改成统一上传 / 下载 / 管理。
@@ -260,6 +260,15 @@ def sniff_package_meta(zip_bytes):
                 if pj:
                     pdata = read_zip_json(zf, pj) or {}
                     meta["module_type"] = pdata.get("module_type") or pdata.get("project_module_type") or ""
+                    if not meta["module_type"] and isinstance(pdata, dict):
+                        # 兼容 V29 前的老工程包：无模块标识时按数据指纹推断，避免老视频包一律落到美术列。
+                        if isinstance(pdata.get("material_workspaces"), dict) or pdata.get("material_module_version"):
+                            meta["module_type"] = "material"
+                        elif any(isinstance(tb, dict) and (tb.get("generated_videos") or tb.get("last_video_status"))
+                                 for sc in (pdata.get("scenes") or []) if isinstance(sc, dict)
+                                 for sh in (sc.get("shots") or []) if isinstance(sh, dict)
+                                 for tb in (sh.get("tabs") or [])):
+                            meta["module_type"] = "video"
     except Exception as e:
         print("[datacenter] 工程包元数据解析失败:", e)
     return meta
@@ -1122,7 +1131,7 @@ def main():
     port = int(os.environ.get("DILAN_DC_PORT", cfg.get("port", 8777)))
     ip = lan_ip()
     print("=" * 52)
-    print("帝蓝工作流-数据中心-V36")
+    print("帝蓝工作流-数据中心-V37")
     print(f"本机访问:   http://127.0.0.1:{port}")
     print(f"局域网访问: http://{ip}:{port}")
     print("制作端 / 审核端的“数据中心地址”请填写上面的局域网地址。")

@@ -3625,6 +3625,44 @@ def find_or_create_import_group(project_data, category, group_name):
     return g, True
 
 
+LEGACY_ASSET_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+LEGACY_ASSET_AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
+LEGACY_ASSET_VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv", ".avi"}
+
+
+def synthesize_legacy_asset_entries(members):
+    """老素材包兼容：按 zip 内目录结构合成与新版 manifest.assets 同构的清单。
+    路径中出现的已知分类目录（人物/场景/道具/音频/视频）决定分类；没有分类目录时
+    按扩展名归类（图片→道具，音频→音频，视频→视频）。能否导入仍由现有
+    VISUAL_ASSET_PACKAGE_CATEGORIES 过滤（不支持的分类进入 skipped 列表提示用户）。"""
+    known_categories = ("人物", "场景", "道具", "音频", "视频")
+    entries = []
+    for arc in sorted(members):
+        low = str(arc or "")
+        if not low or low.endswith("/"):
+            continue
+        name = low.rsplit("/", 1)[-1]
+        if name.lower() in ("manifest.json", "export_info.json", "usage_summary.json", "project.json"):
+            continue
+        ext = ("." + name.rsplit(".", 1)[-1].lower()) if "." in name else ""
+        if ext in LEGACY_ASSET_IMAGE_EXTS:
+            default_cat = "道具"
+        elif ext in LEGACY_ASSET_AUDIO_EXTS:
+            default_cat = "音频"
+        elif ext in LEGACY_ASSET_VIDEO_EXTS:
+            default_cat = "视频"
+        else:
+            continue
+        cat = ""
+        for seg in low.split("/")[:-1]:
+            if seg in known_categories:
+                cat = seg
+                break
+        stem = name.rsplit(".", 1)[0] if "." in name else name
+        entries.append({"name": stem, "category": cat or default_cat, "file": arc})
+    return entries
+
+
 def import_asset_package_into_project(project_id, data_url, filename="", importer_name=""):
     pid = safe_name(project_id or "", "")
     if not pid:
@@ -3647,9 +3685,18 @@ def import_asset_package_into_project(project_id, data_url, filename="", importe
             if arc is not None:
                 members[arc] = info
         manifest = read_zip_json(zf, "manifest.json", {}) or {}
-        if manifest.get("package_type") != "dilan_asset_package":
+        package_type = str(manifest.get("package_type") or "").strip()
+        if package_type and package_type != "dilan_asset_package":
             raise ValueError("请选择素材包，不要选择工程包")
         package_assets = manifest.get("assets") if isinstance(manifest.get("assets"), list) else []
+        if not package_assets:
+            # 兼容老版本素材包：没有 manifest 或没有 assets 清单时，先排除工程包，
+            # 再按压缩包目录结构合成清单（目录名=分类，文件名=素材名）。
+            if any(arc == "project.json" or arc.endswith("/project.json") for arc in members):
+                raise ValueError("请选择素材包，不要选择工程包")
+            package_assets = synthesize_legacy_asset_entries(members)
+            if not package_assets:
+                raise ValueError("素材包中没有可识别的素材文件：请确认压缩包内含 人物/场景/道具 目录或图片文件。")
         existing_names = [a.get("name") for a in data.get("assets", []) or [] if not a.get("temporary")]
         for item in package_assets:
             if not isinstance(item, dict):
@@ -4049,7 +4096,42 @@ def package_module_label(module_type):
 
 def detect_project_package_module(manifest, project_data=None):
     project_data = project_data if isinstance(project_data, dict) else {}
-    return str((manifest or {}).get("module_type") or (manifest or {}).get("tool_module") or project_data.get("module_type") or project_data.get("project_module_type") or "").strip()
+    declared = str((manifest or {}).get("module_type") or (manifest or {}).get("tool_module") or project_data.get("module_type") or project_data.get("project_module_type") or "").strip()
+    if declared:
+        return declared
+    return infer_project_package_module(project_data)
+
+
+def infer_project_package_module(project_data):
+    """兼容 V29 前的老工程包：没有模块标识时按工程数据指纹推断所属模块。
+    美术：工作区结构（material_workspaces）是美术模块独有；
+    视频：generated_videos / last_video_status / video_* 参数只出现在视频模块。
+    老分镜包与未启用工作区的更老美术包结构相同，无法区分时返回空串，
+    由 validate 按「用户当前发起导入的模块」兜底导入。"""
+    data = project_data if isinstance(project_data, dict) else {}
+    if isinstance(data.get("material_workspaces"), dict) or data.get("material_module_version") or data.get("active_material_workspace"):
+        return "material"
+    ps = data.get("project_settings") if isinstance(data.get("project_settings"), dict) else {}
+    if any(k in ps for k in ("video_model", "video_duration", "video_ratio", "video_resolution")):
+        return "video"
+    for scene in (data.get("scenes") or []):
+        if not isinstance(scene, dict):
+            continue
+        for shot in (scene.get("shots") or []):
+            if not isinstance(shot, dict):
+                continue
+            for tab in (shot.get("tabs") or []):
+                if not isinstance(tab, dict):
+                    continue
+                if tab.get("generated_videos") or tab.get("last_video_status"):
+                    return "video"
+                st = tab.get("settings") if isinstance(tab.get("settings"), dict) else {}
+                if any(k in st for k in ("video_model", "video_duration", "video_generate_audio")):
+                    return "video"
+                for img in (tab.get("generated_images") or []):
+                    if isinstance(img, dict) and (img.get("media_type") == "video" or img.get("video_id")):
+                        return "video"
+    return ""
 
 
 def import_project_package_into_module(module_type, data_url, filename="", importer_name=""):
@@ -4079,7 +4161,9 @@ def validate_project_package_module(manifest, project_data=None):
         raise ValueError("该 ZIP 不是帝蓝工作流工程包，无法导入")
     module_type = detect_project_package_module(manifest, project_data)
     if not module_type:
-        raise ValueError(f"该工程包缺少模块标识，无法判断属于素材/图片/视频哪一个模块。请使用 V29 及以后由{PROJECT_MODULE_LABEL}导出的工程包。")
+        # 兼容 V29 前的老工程包：无模块标识、内容指纹也无法判别（老分镜包与未启用
+        # 工作区的老美术包结构一致）。按用户发起导入的当前模块导入，不再拒绝。
+        return True
     if module_type != PROJECT_MODULE_TYPE:
         return False
     return True
@@ -4115,6 +4199,8 @@ def import_project_package(data_url, filename="", importer_name="", target_paren
         if module_type and module_type != PROJECT_MODULE_TYPE:
             return import_project_package_into_module(module_type, data_url, filename, importer_name)
         validate_project_package_module(manifest, project_data)
+        # 老工程包补写模块标识：导入后再导出/识别不再缺失。
+        project_data.setdefault("module_type", PROJECT_MODULE_TYPE)
 
         parent_json_arc = manifest.get("parent_json")
         parent_data = read_zip_json(zf, parent_json_arc, None) if parent_json_arc else None
