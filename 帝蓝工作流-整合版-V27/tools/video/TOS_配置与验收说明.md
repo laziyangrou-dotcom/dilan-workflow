@@ -1,4 +1,4 @@
-# Seedance 2.0 参考视频 · 火山 TOS 配置与验收说明（V34）
+# Seedance 2.0 参考视频 · 火山 TOS 配置与验收说明（V35）
 
 本说明配合「为视频模块 Seedance 2.0 增加引用视频素材（云端 URL）」功能。
 Seedance 2.0 的参考视频（`reference_video`）只接受**公网可访问的 URL**，不接受本地路径，
@@ -80,7 +80,7 @@ VOLC_TOS_SECRET_ACCESS_KEY  或  TOS_SECRET_ACCESS_KEY
 | 3 | 删掉 TOS 对象、保留本地文件，再生成 | 后端用本地文件**重新上传**到 key 并更新 `remote` |
 | 4 | TOS 对象和本地文件都没了 | 明确中文报错：`参考视频素材"xxx"已丢失：本地文件不存在，TOS 对象也不存在。请重新上传该素材。` |
 | 5 | 生成一个视频 | 生成记录含 `remote.provider="tos"`；再次拿它当参考素材不依赖 Ark 原始 `remote_url` |
-| 6 | 图片参考照常 | 图片仍走 `data:`，不受影响 |
+| 6 | 图片/音频参考（V35 起） | 启用 TOS 时图片、音频参考也自动上传 TOS 并以预签名 URL 传给 Ark（按内容 sha256 去重，同一文件只上传一次）；未启用 TOS 才回退内嵌 `data:`。几十 MB 的 base64 请求体会被 Ark 网关直接断开（WinError 10054），故建议保持 TOS 启用 |
 
 未启用 TOS 却 `@` 了本地视频时，会得到友好报错：
 `当前引用了本地视频素材，但 Seedance 2.0 参考视频必须使用公网 URL。请在视频模块 config.json 启用 TOS…`
@@ -106,3 +106,14 @@ VOLC_TOS_SECRET_ACCESS_KEY  或  TOS_SECRET_ACCESS_KEY
 - TOS 会产生**存储 + 外网下行流量**费用；`tos_upload_generated_videos=true` 会把每个生成视频也存到 TOS，按需关闭。
 - AK/SK 永远只放环境变量，别写进 `config.json` / `project.json` / 代码。
 - 本地素材文件不会被删除，是 TOS 丢失时的兜底。
+
+## 七、V35 起的素材上传范围
+
+- **视频模块（Seedance）**：@ 引用的图片、音频、视频参考素材**全部**先上传 TOS、再以预签名 URL
+  传给 Ark；参考文件按内容 sha256 存到 `<prefix>cache/`，同一文件只上传一次，之后只重新签 URL。
+- **美术 / 分镜模块（GPT 聊天模式的参考图）**：同样走 TOS 预签名 URL（OpenAI Responses 支持
+  URL 参考图）；TOS 配置与密钥**共用视频模块这一份**，不用另配。上传失败时自动回退内嵌 base64，
+  不影响聊天可用性。
+- **不经过 TOS 的两条链路（上游 API 限制，无法用外链 URL）**：
+  - gpt 生图出图（OpenAI `images/edits`）：官方 multipart 文件直传通道，只收文件字节；
+  - Nano Banana（Gemini `inline_data`）：只收 base64 / 谷歌自家文件服务。

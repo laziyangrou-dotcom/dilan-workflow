@@ -2121,6 +2121,173 @@ def build_gpt_responses_instructions(kind, referenced_assets=None, operation="ge
     return "\n".join(base)
 
 
+# =========================================================================
+# 火山 TOS：聊天参考图上传。TOS 配置与密钥同视频模块共用一份——配置读
+# tools/video/config.json（在视频模块「全局设置」页维护），AK/SK 只读环境变量。
+# 说明：OpenAI Responses 的 input_image 支持 https URL，启用 TOS 后聊天参考图
+# 改走预签名 URL，把请求体里的大体积 base64 全部替换掉；gpt 生图(images/edits)
+# 与 Gemini 的 API 不接受外链 URL，仍按官方要求直传文件字节，不经过 TOS。
+# =========================================================================
+VIDEO_TOOL_CONFIG_PATH = ROOT.parent / "video" / "config.json"
+
+
+def is_http_url(url: str) -> bool:
+    u = str(url or "").strip().lower()
+    return u.startswith("http://") or u.startswith("https://")
+
+
+def get_tos_settings():
+    try:
+        with open(VIDEO_TOOL_CONFIG_PATH, "r", encoding="utf-8") as f:
+            cfg = json.load(f) or {}
+    except Exception:
+        cfg = {}
+    g = cfg.get("global_defaults") or {}
+    ak = os.environ.get("VOLC_TOS_ACCESS_KEY_ID") or os.environ.get("TOS_ACCESS_KEY_ID") or ""
+    sk = os.environ.get("VOLC_TOS_SECRET_ACCESS_KEY") or os.environ.get("TOS_SECRET_ACCESS_KEY") or ""
+    prefix = str(g.get("tos_prefix") or "dilan-workflow/video-module/").strip().strip("/")
+    return {
+        "enabled": bool(g.get("tos_enabled")),
+        "bucket": str(g.get("tos_bucket") or "").strip(),
+        "region": str(g.get("tos_region") or "cn-beijing").strip(),
+        "endpoint": str(g.get("tos_endpoint") or "https://tos-cn-beijing.volces.com").strip(),
+        "prefix": (prefix + "/") if prefix else "",
+        "presign_expire_seconds": int(g.get("tos_presign_expire_seconds") or 86400),
+        "ak": ak,
+        "sk": sk,
+    }
+
+
+_TOS_CLIENT_CACHE = {}
+_TOS_CLIENT_GUARD = threading.Lock()
+
+
+def get_tos_client():
+    s = get_tos_settings()
+    if not s["enabled"]:
+        raise RuntimeError("TOS 未启用：请在视频模块「全局设置」中开启 TOS。")
+    if not s["bucket"]:
+        raise RuntimeError("TOS bucket 未配置，请在视频模块「全局设置」中填写桶名。")
+    if not s["ak"] or not s["sk"]:
+        raise RuntimeError("TOS AK/SK 未配置，请设置环境变量 VOLC_TOS_ACCESS_KEY_ID 和 VOLC_TOS_SECRET_ACCESS_KEY。")
+    cache_key = (s["ak"], s["sk"], s["endpoint"], s["region"])
+    with _TOS_CLIENT_GUARD:
+        client = _TOS_CLIENT_CACHE.get(cache_key)
+        if client is not None:
+            return client
+        try:
+            import tos
+        except Exception as e:
+            raise RuntimeError("缺少火山 TOS Python SDK，请先安装依赖：pip install tos") from e
+        try:
+            client = tos.TosClientV2(s["ak"], s["sk"], s["endpoint"], s["region"])
+        except Exception as e:
+            raise RuntimeError(f"初始化 TOS 客户端失败：{e}") from e
+        _TOS_CLIENT_CACHE[cache_key] = client
+        return client
+
+
+def upload_file_to_tos(fp: Path, key: str, content_type: str = "") -> dict:
+    if not fp or not fp.exists() or not fp.is_file():
+        raise RuntimeError(f"待上传文件不存在：{fp}")
+    s = get_tos_settings()
+    client = get_tos_client()
+    bucket = s["bucket"]
+    mime = content_type or mimetypes.guess_type(str(fp))[0] or "application/octet-stream"
+    try:
+        if hasattr(client, "put_object_from_file"):
+            client.put_object_from_file(bucket, key, str(fp))
+        else:
+            with open(fp, "rb") as f:
+                client.put_object(bucket, key, content=f.read())
+    except Exception as e:
+        raise RuntimeError(f"TOS 上传失败：{fp.name} -> {key}，原因：{e}") from e
+    return {"provider": "tos", "bucket": bucket, "key": key, "content_type": mime, "size": fp.stat().st_size}
+
+
+def tos_object_exists(bucket: str, key: str) -> bool:
+    try:
+        client = get_tos_client()
+    except Exception:
+        return False
+    try:
+        if hasattr(client, "head_object"):
+            client.head_object(bucket, key)
+            return True
+        return True
+    except Exception:
+        return False
+
+
+def generate_tos_presigned_get_url(bucket: str, key: str, expires: int = None) -> str:
+    s = get_tos_settings()
+    client = get_tos_client()
+    expires = int(expires or s["presign_expire_seconds"])
+    try:
+        import tos
+    except Exception as e:
+        raise RuntimeError("缺少火山 TOS Python SDK，请先安装：pip install tos") from e
+    method_get = "GET"
+    http_enum = getattr(tos, "HttpMethodType", None)
+    if http_enum is not None:
+        method_get = (getattr(http_enum, "Http_Method_Get", None)
+                      or getattr(http_enum, "HTTP_METHOD_GET", None)
+                      or method_get)
+    result = None
+    last_exc = None
+    if hasattr(client, "pre_signed_url"):
+        for attempt in (
+            lambda: client.pre_signed_url(method_get, bucket, key, expires),
+            lambda: client.pre_signed_url(http_method=method_get, bucket=bucket, key=key, expires=expires),
+            lambda: client.pre_signed_url(method=method_get, bucket=bucket, key=key, expires=expires),
+        ):
+            try:
+                result = attempt()
+                break
+            except TypeError as te:
+                last_exc = te
+                continue
+            except Exception as e:
+                raise RuntimeError(f"TOS 预签名 URL 生成失败：{key}，原因：{e}") from e
+    if result is None:
+        raise RuntimeError(f"当前 TOS SDK 未找到匹配的 pre_signed_url 调用方式（{last_exc}）。")
+    if isinstance(result, str):
+        return result
+    for attr in ("signed_url", "presigned_url", "url"):
+        v = getattr(result, attr, None)
+        if isinstance(v, str) and v:
+            return v
+    if isinstance(result, dict):
+        for k in ("signed_url", "presigned_url", "url"):
+            if isinstance(result.get(k), str) and result[k]:
+                return result[k]
+    raise RuntimeError(f"TOS 预签名 URL 返回值无法解析：{type(result)}")
+
+
+def ensure_local_file_remote_url(fp: Path) -> str:
+    """内容寻址的 TOS 缓存：按 sha256 生成固定 key，同一内容只上传一次，之后只重签 URL。"""
+    fp = Path(fp)
+    if not fp.exists() or not fp.is_file():
+        raise RuntimeError(f"参考文件不存在：{fp}")
+    s = get_tos_settings()
+    sha = sha256_file(fp)
+    suffix = (fp.suffix or "").lower()
+    key = f"{s['prefix']}cache/{sha}{suffix}"
+    if not tos_object_exists(s["bucket"], key):
+        upload_file_to_tos(fp, key, mimetypes.guess_type(str(fp))[0] or "")
+    return generate_tos_presigned_get_url(s["bucket"], key)
+
+
+def reference_image_url_for_responses(fp):
+    """聊天参考图：启用 TOS 时优先预签名 URL（大幅缩小请求体）；未启用或上传失败回退 data:。"""
+    try:
+        if get_tos_settings()["enabled"]:
+            return ensure_local_file_remote_url(Path(fp))
+    except Exception as e:
+        print("参考图上传 TOS 失败，回退内嵌 base64：", fp, e, flush=True)
+    return local_to_data_url(fp)
+
+
 def build_gpt_responses_history_input(thread, user_text, image_paths=None, prompt_override=None, document_file_ids=None):
     image_paths = image_paths or []
     document_file_ids = document_file_ids or []
@@ -2132,7 +2299,7 @@ def build_gpt_responses_history_input(thread, user_text, image_paths=None, promp
     content.append({"type": "input_text", "text": text})
     for fp in image_paths[:16]:
         try:
-            content.append({"type": "input_image", "image_url": local_to_data_url(fp)})
+            content.append({"type": "input_image", "image_url": reference_image_url_for_responses(fp)})
         except Exception:
             pass
     return [{"role": "user", "content": content}]

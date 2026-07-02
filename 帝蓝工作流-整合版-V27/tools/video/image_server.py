@@ -3956,6 +3956,23 @@ def ensure_asset_remote_url(pid: str, asset: dict, require_video: bool = False) 
     return generate_tos_presigned_get_url(meta["bucket"], meta["key"])
 
 
+def ensure_local_file_remote_url(fp: Path) -> str:
+    """内容寻址的 TOS 缓存：本地文件按 sha256 生成固定 key，同一内容只上传一次，
+    之后每次调用只重新生成预签名 URL。用于图片/音频等参考文件——把 Ark 请求体里的
+    大体积 base64 全部替换成云端 URL（几十 MB 的 base64 请求体会被 Ark 网关直接
+    断开连接：WinError 10054 远程主机强迫关闭了一个现有的连接）。"""
+    fp = Path(fp)
+    if not fp.exists() or not fp.is_file():
+        raise RuntimeError(f"参考文件不存在：{fp}")
+    s = get_tos_settings()
+    sha = sha256_file(fp)
+    suffix = (fp.suffix or "").lower()
+    key = f"{s['prefix']}cache/{sha}{suffix}"
+    if not tos_object_exists(s["bucket"], key):
+        upload_file_to_tos(fp, key, mimetypes.guess_type(str(fp))[0] or "")
+    return generate_tos_presigned_get_url(s["bucket"], key)
+
+
 def seedance_content_from_prompt(prompt: str, data: dict, tab: dict, pid: str = ""):
     content = [{"type": "text", "text": prompt or ""}]
     # V24：@素材 候选池改为全项目素材库（不再限于当前标签页引用素材），与美术/分镜一致。
@@ -3982,14 +3999,14 @@ def seedance_content_from_prompt(prompt: str, data: dict, tab: dict, pid: str = 
                 raise ValueError(f"参考视频“{asset.get('name')}”未能生成公网 URL，请检查 TOS 配置。")
             content.append({"type": "video_url", "video_url": {"url": url}, "role": "reference_video"})
         elif cat == "音频":
-            # 音频 V1 暂保持原 data: 逻辑；若 Ark 后续拒收 data audio，再同样云端化。
-            if fp and fp.exists():
-                url = local_to_data_url(fp)
+            # 音频参考：启用 TOS 时上传后走预签名 URL；大 base64 会把 Ark 请求体撑爆（10054 被断开）。
+            if fp and fp.exists() and not is_http_url(url):
+                url = ensure_local_file_remote_url(fp) if get_tos_settings()["enabled"] else local_to_data_url(fp)
             content.append({"type": "audio_url", "audio_url": {"url": url}, "role": "reference_audio"})
         else:
-            # 图片 V1 不强制改，继续走 data: base64。
-            if fp and fp.exists():
-                url = local_to_data_url(fp)
+            # 图片参考：同样优先 TOS 预签名 URL；未启用 TOS 才回退内嵌 base64。
+            if fp and fp.exists() and not is_http_url(url):
+                url = ensure_local_file_remote_url(fp) if get_tos_settings()["enabled"] else local_to_data_url(fp)
             content.append({"type": "image_url", "image_url": {"url": url}, "role": "reference_image"})
     return content
 
@@ -4011,11 +4028,17 @@ def sanitize_payload_for_record(payload):
                 it = dict(item)
                 for url_key in ("image_url", "audio_url", "video_url"):
                     holder = it.get(url_key)
-                    if isinstance(holder, dict) and isinstance(holder.get("url"), str) \
-                            and holder["url"].startswith("data:"):
-                        h = dict(holder)
-                        h["url"] = "[内嵌素材已省略]"
-                        it[url_key] = h
+                    if isinstance(holder, dict) and isinstance(holder.get("url"), str):
+                        u = holder["url"]
+                        if u.startswith("data:"):
+                            h = dict(holder)
+                            h["url"] = "[内嵌素材已省略]"
+                            it[url_key] = h
+                        elif u.startswith("http") and "?" in u and "x-tos-" in u.lower():
+                            # TOS 预签名 URL：记录里只留对象路径，去掉会过期且含签名的查询参数。
+                            h = dict(holder)
+                            h["url"] = u.split("?", 1)[0] + "?[预签名参数已省略]"
+                            it[url_key] = h
                 new_content.append(it)
             slim[k] = new_content
         elif isinstance(v, str) and v.startswith("data:"):
