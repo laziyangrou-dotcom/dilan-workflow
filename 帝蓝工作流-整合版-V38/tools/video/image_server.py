@@ -1957,7 +1957,12 @@ def remove_public_file(path):
         try:
             fp.unlink()
         except Exception:
-            pass
+            # Windows 下文件被占用删不掉时改名挪开：不让旧文件占住素材名，
+            # 否则同名重传会被迫改名成「xx(1)」或与旧文件混淆。
+            try:
+                fp.rename(fp.with_name(f".deleted_{uuid.uuid4().hex[:8]}_{fp.name}"))
+            except Exception:
+                pass
 
 
 def find_generated_image_in_shot(shot, image_id):
