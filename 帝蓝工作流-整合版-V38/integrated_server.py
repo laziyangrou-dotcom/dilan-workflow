@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-帝蓝工作流整合版 V40
+帝蓝工作流整合版 V41
 - 统一入口： http://127.0.0.1:8787/material、/image 或 /video
 - 素材、图片、视频工具作为三个独立子服务运行，核心代码互不合并。
 """
@@ -9,6 +9,7 @@ import atexit
 import base64
 import io
 import json
+import http.client
 import http.server
 import os
 import signal
@@ -160,7 +161,7 @@ def set_user_env_var_windows(name: str, value: str):
 
 
 class GatewayHandler(http.server.BaseHTTPRequestHandler):
-    server_version = "DilanIntegratedV40/1.0"
+    server_version = "DilanIntegratedV41/1.0"
 
     def log_message(self, fmt, *args):
         print("[gateway]", self.address_string(), "-", fmt % args)
@@ -287,6 +288,11 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             self.proxy_project_import(upstream_path, query, fallback_tool=tool, head_only=head_only)
             return
 
+        # 大文件流式导入：按块转发上传体，网关不把整包读进内存（工程包/素材包再大也不溢出）。
+        if self.command.upper() == "POST" and upstream_path in ("/api/project/import/stream", "/api/assets/package/import/stream"):
+            self.proxy_stream(f"http://127.0.0.1:{upstream_for_tool(tool)}{upstream_path}{query}")
+            return
+
         port = upstream_for_tool(tool)
         url = f"http://127.0.0.1:{port}{upstream_path}{query}"
         self.proxy_request(url, head_only=head_only)
@@ -340,6 +346,52 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(length) if length else None
         self.proxy_request_with_body(url, body, head_only=head_only)
 
+    def proxy_stream(self, url: str):
+        """把上传请求体按块流式转发到子服务，全程只占用一个块的内存（用于大文件导入）。
+        响应体（导入结果 JSON）很小，可整块读回。"""
+        length = int(self.headers.get("Content-Length") or "0")
+        parts = urlsplit(url)
+        conn = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=3600)
+        try:
+            path = parts.path + (("?" + parts.query) if parts.query else "")
+            conn.putrequest(self.command, path, skip_host=True, skip_accept_encoding=True)
+            for k, v in self.headers.items():
+                lk = k.lower()
+                if lk in HOP_BY_HOP_HEADERS or lk == "host":
+                    continue
+                conn.putheader(k, v)
+            conn.putheader("Host", parts.netloc)
+            conn.endheaders()
+            remaining = length
+            chunk_size = 1024 * 1024
+            while remaining > 0:
+                data = self.rfile.read(min(chunk_size, remaining))
+                if not data:
+                    break
+                conn.send(data)
+                remaining -= len(data)
+            resp = conn.getresponse()
+            data = resp.read()
+            self.send_response(resp.status, resp.reason)
+            self.copy_response_headers(resp.headers, data)
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as e:
+            msg = f"Gateway stream error: {e}".encode("utf-8", "replace")
+            try:
+                self.send_response(502)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(msg)))
+                self.end_headers()
+                self.wfile.write(msg)
+            except Exception:
+                pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     def copy_response_headers(self, src_headers, data: bytes):
         sent_len = False
         for k, v in src_headers.items():
@@ -366,7 +418,7 @@ def handle_exit_signal(signum, frame):
 
 def main():
     print("============================================")
-    print("帝蓝工作流整合版 V40")
+    print("帝蓝工作流整合版 V41")
     print("统一入口: http://127.0.0.1:%s/material" % GATEWAY_PORT)
     print("素材子服务: http://127.0.0.1:%s" % MATERIAL_PORT)
     print("图片子服务: http://127.0.0.1:%s" % IMAGE_PORT)

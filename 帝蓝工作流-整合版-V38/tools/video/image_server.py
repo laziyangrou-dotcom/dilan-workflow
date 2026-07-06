@@ -2682,12 +2682,34 @@ def synthesize_legacy_asset_entries(members):
 
 
 def import_asset_package_into_project(project_id, data_url, filename="", importer_name=""):
+    # 兼容旧的 base64 JSON 上传：解码后落临时文件，走低内存磁盘解压路径。
+    IMPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    _tmp = IMPORTS_DIR / f"_asset_import_{uuid.uuid4().hex}.zip"
+    try:
+        raw = decode_data_url_bytes(data_url)
+        if len(raw) < 4 or not raw.startswith(b"PK"):
+            raise ValueError("请选择本工具导出的 .zip 素材包")
+        _tmp.write_bytes(raw)
+        del raw
+        return import_asset_package_from_zip_path(project_id, _tmp, filename, importer_name)
+    finally:
+        try:
+            _tmp.unlink()
+        except Exception:
+            pass
+
+
+def import_asset_package_from_zip_path(project_id, zip_path, filename="", importer_name=""):
+    """从磁盘上的 zip 素材包直接解压导入，低内存。"""
     pid = safe_name(project_id or "", "")
     if not pid:
         raise ValueError("missing project")
-    raw = decode_data_url_bytes(data_url)
-    if len(raw) < 4 or not raw.startswith(b"PK"):
+    zip_path = Path(zip_path)
+    if (not zip_path.exists()) or zip_path.stat().st_size < 4:
         raise ValueError("请选择本工具导出的 .zip 素材包")
+    with open(zip_path, "rb") as _pk:
+        if _pk.read(2) != b"PK":
+            raise ValueError("请选择本工具导出的 .zip 素材包")
     data = load_project(pid)
     ensure_asset_groups(data)
     imported_at = now_str()
@@ -2696,7 +2718,7 @@ def import_asset_package_into_project(project_id, data_url, filename="", importe
     skipped = []
     created_groups = 0
     merged_groups = 0
-    with zipfile.ZipFile(io.BytesIO(raw), "r") as zf:
+    with zipfile.ZipFile(zip_path, "r") as zf:
         members = {}
         for info in zf.infolist():
             arc = safe_zip_arcname(info.filename)
@@ -3153,7 +3175,7 @@ def infer_project_package_module(project_data):
     return ""
 
 
-def import_project_package_into_module(module_type, data_url, filename="", importer_name=""):
+def import_project_package_into_module(module_type, zip_path, filename="", importer_name=""):
     module_type = str(module_type or "").strip()
     if module_type == PROJECT_MODULE_TYPE:
         raise ValueError("工程包已经属于当前模块，无需转发导入")
@@ -3168,7 +3190,7 @@ def import_project_package_into_module(module_type, data_url, filename="", impor
         raise ValueError(f"无法加载{package_module_label(module_type)}导入服务")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return mod.import_project_package(data_url, filename, importer_name, "")
+    return mod.import_project_package_from_zip_path(zip_path, filename, importer_name, "")
 
 
 def validate_project_package_module(manifest, project_data=None):
@@ -3189,11 +3211,34 @@ def validate_project_package_module(manifest, project_data=None):
 
 
 def import_project_package(data_url, filename="", importer_name="", target_parent=""):
-    raw = decode_data_url_bytes(data_url)
-    if len(raw) < 4 or not raw.startswith(b"PK"):
+    # 兼容旧的 base64 JSON 上传：解码后落临时文件，走与大文件相同的低内存磁盘解压路径。
+    IMPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    _tmp = IMPORTS_DIR / f"_import_{uuid.uuid4().hex}.zip"
+    try:
+        raw = decode_data_url_bytes(data_url)
+        if len(raw) < 4 or not raw.startswith(b"PK"):
+            raise ValueError("请选择由本工具导出的 .zip 工程包")
+        _tmp.write_bytes(raw)
+        del raw
+        return import_project_package_from_zip_path(_tmp, filename, importer_name, target_parent)
+    finally:
+        try:
+            _tmp.unlink()
+        except Exception:
+            pass
+
+
+def import_project_package_from_zip_path(zip_path, filename="", importer_name="", target_parent=""):
+    """从磁盘上的 zip 工程包直接解压导入：zipfile 只按需读取中央目录和单个成员，
+    不会把整包读进内存，因此工程包再大也不会内存溢出。"""
+    zip_path = Path(zip_path)
+    if (not zip_path.exists()) or zip_path.stat().st_size < 4:
         raise ValueError("请选择由本工具导出的 .zip 工程包")
+    with open(zip_path, "rb") as _pk:
+        if _pk.read(2) != b"PK":
+            raise ValueError("请选择由本工具导出的 .zip 工程包")
     imported_at = now_str()
-    with zipfile.ZipFile(io.BytesIO(raw), "r") as zf:
+    with zipfile.ZipFile(zip_path, "r") as zf:
         members = []
         member_names = set()
         for info in zf.infolist():
@@ -3216,7 +3261,7 @@ def import_project_package(data_url, filename="", importer_name="", target_paren
             raise ValueError("project.json 无法读取或格式不正确")
         module_type = detect_project_package_module(manifest, project_data)
         if module_type and module_type != PROJECT_MODULE_TYPE:
-            return import_project_package_into_module(module_type, data_url, filename, importer_name)
+            return import_project_package_into_module(module_type, zip_path, filename, importer_name)
         validate_project_package_module(manifest, project_data)
         # 老工程包补写模块标识：导入后再导出/识别不再缺失。
         project_data.setdefault("module_type", PROJECT_MODULE_TYPE)
@@ -4362,6 +4407,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.api_project_save()
             elif path == "/api/project/import":
                 self.api_project_import()
+            elif path == "/api/project/import/stream":
+                self.api_project_import_stream()
             elif path == "/api/project/merge":
                 self.api_project_merge()
             elif path == "/api/datacenter/config/save":
@@ -4380,6 +4427,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.api_datacenter_delete_child()
             elif path == "/api/assets/package/import":
                 self.api_asset_package_import()
+            elif path == "/api/assets/package/import/stream":
+                self.api_asset_package_import_stream()
             elif path == "/api/review/note_image_upload":
                 self.api_review_note_image_upload()
             elif path == "/api/user/set_name":
@@ -4583,6 +4632,58 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(400, {"error": "missing project"}); return
         zip_path, manifest = create_project_export_zip(pid, user_name)
         self.send_download(zip_path, zip_path.name, "application/zip")
+
+    def _stream_body_to_file(self, dest, chunk_size=1024 * 1024):
+        """按 Content-Length 分块把上传体流式写入磁盘临时文件，全程只占用一个块的内存。"""
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        if length <= 0:
+            raise ValueError("空的上传内容")
+        dest = Path(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        remaining = length
+        with open(dest, "wb") as fh:
+            while remaining > 0:
+                data = self.rfile.read(min(chunk_size, remaining))
+                if not data:
+                    break
+                fh.write(data)
+                remaining -= len(data)
+        if remaining > 0:
+            raise ValueError("上传中断：接收到的数据不完整，请重试")
+
+    def api_project_import_stream(self):
+        qs = parse_qs(urlsplit(self.path).query)
+        filename = (qs.get("filename") or [""])[0]
+        user_name = (qs.get("user_name") or [""])[0]
+        target_parent = (qs.get("target_parent") or qs.get("parent") or [""])[0]
+        IMPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = IMPORTS_DIR / f"_import_{uuid.uuid4().hex}.zip"
+        try:
+            self._stream_body_to_file(tmp)
+            result = import_project_package_from_zip_path(tmp, filename, user_name, target_parent)
+            self.send_json(200, {"ok": True, **result})
+        finally:
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
+
+    def api_asset_package_import_stream(self):
+        qs = parse_qs(urlsplit(self.path).query)
+        project = (qs.get("project") or [""])[0]
+        filename = (qs.get("filename") or [""])[0]
+        user_name = (qs.get("user_name") or [""])[0]
+        IMPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = IMPORTS_DIR / f"_asset_import_{uuid.uuid4().hex}.zip"
+        try:
+            self._stream_body_to_file(tmp)
+            result = import_asset_package_from_zip_path(project, tmp, filename, user_name)
+            self.send_json(200, {"ok": True, **result})
+        finally:
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
 
     def api_project_import(self):
         body = self.read_body()
