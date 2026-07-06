@@ -766,6 +766,57 @@ def save_project(pid, data):
     return data
 
 
+def _iter_project_tabs(data):
+    # 遍历工程内所有标签页（scene -> shot -> tab），供生成结果并集保护使用。
+    for scene in (data.get("scenes") or []):
+        for shot in (scene.get("shots") or []):
+            for tab in (shot.get("tabs") or []):
+                if isinstance(tab, dict):
+                    yield tab
+
+
+def merge_generated_media_preserve(client_data, disk_data):
+    # 把磁盘上已存在、但客户端整份快照里缺失的生成结果（视频/图片）与其生成消息并回
+    # 客户端数据，避免“前端整份覆盖保存”把后台并发刚写回的结果吞掉。生成结果只会通过
+    # 专门的删除接口移除，绝不会经由整份保存接口删除，因此这里只做“按 id 补齐”
+    # （只增不减），语义安全，不会让已删除的结果复活。
+    if not isinstance(client_data, dict) or not isinstance(disk_data, dict):
+        return
+    disk_tabs = {}
+    for tab in _iter_project_tabs(disk_data):
+        tid = tab.get("tab_id")
+        if tid:
+            disk_tabs[tid] = tab
+    if not disk_tabs:
+        return
+    for tab in _iter_project_tabs(client_data):
+        dtab = disk_tabs.get(tab.get("tab_id"))
+        if not dtab:
+            continue
+        # generated_images 是视频/图片本体，generated_videos 是它的镜像，按 image_id 补齐。
+        imgs = tab.get("generated_images")
+        if not isinstance(imgs, list):
+            imgs = []
+        have = {it.get("image_id") for it in imgs if isinstance(it, dict)}
+        for it in (dtab.get("generated_images") or []):
+            if isinstance(it, dict) and it.get("image_id") not in have:
+                imgs.append(it); have.add(it.get("image_id"))
+        tab["generated_images"] = imgs
+        tab["generated_videos"] = imgs
+        # 生成/对话消息按 message_id 只补不删，补齐后按时间排序，避免结果气泡丢失。
+        msgs = tab.get("messages")
+        if not isinstance(msgs, list):
+            msgs = []
+        mhave = {m.get("message_id") for m in msgs if isinstance(m, dict)}
+        added = False
+        for m in (dtab.get("messages") or []):
+            if isinstance(m, dict) and m.get("message_id") and m.get("message_id") not in mhave:
+                msgs.append(m); mhave.add(m.get("message_id")); added = True
+        if added:
+            msgs.sort(key=lambda mm: str(mm.get("time") or "") if isinstance(mm, dict) else "")
+        tab["messages"] = msgs
+
+
 def operation_log_path(pid):
     # Snapshot / operation-log feature removed: keep helper for compatibility only.
     return project_path(pid) / "operation_log.jsonl"
@@ -4322,6 +4373,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._headers(None)
         self.end_headers()
 
+    def begin_project_mutation(self, pid):
+        # 获取该工程的互斥锁，并在锁内“重新”读取一份最新工程数据返回。与随后的
+        # save_project(pid, data) 配对，使整个“读取->修改->保存”串行化，从而不会把并发
+        # 生成刚写回磁盘的视频/图片覆盖吞掉（例如一边在生成视频、一边点“新增子栏”）。
+        # 锁在 do_POST 的 finally 里统一释放，任何异常都不会导致锁泄漏。
+        lk = project_mutation_lock(pid)
+        lk.acquire()
+        if not hasattr(self, "_held_locks"):
+            self._held_locks = []
+        self._held_locks.append(lk)
+        return load_project(pid)
+
+    def _release_held_locks(self):
+        # 释放本次请求 begin_project_mutation 期间持有的所有工程锁。
+        locks = getattr(self, "_held_locks", None)
+        if not locks:
+            return
+        while locks:
+            lk = locks.pop()
+            try:
+                lk.release()
+            except Exception:
+                pass
+
     def do_GET(self):
         parsed = urlsplit(self.path)
         path = unquote(parsed.path)
@@ -4388,6 +4463,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlsplit(self.path)
         path = parsed.path
+        self._held_locks = []
         try:
             if path == "/api/config/save":
                 self.send_json(200, save_config(self.read_body()))
@@ -4506,6 +4582,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             print("POST ERROR", e)
             self.send_json(500, {"error": str(e)})
+        finally:
+            self._release_held_locks()
 
     def api_snapshots_list(self, pid):
         pid = safe_name(pid or "")
@@ -4614,7 +4692,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(400, {"error": "missing project"}); return
         if not new_name:
             self.send_json(400, {"error": "请输入新的子项目名称"}); return
-        data = load_project(pid)
+        data = self.begin_project_mutation(pid)
         data["project_name"] = new_name
         data["updated_at"] = now_str()
         saved = save_project(pid, data)
@@ -4815,6 +4893,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         _lock = project_mutation_lock(pid)
         _lock.acquire()
         try:
+            # 前端保存的是整份工程快照；若此刻后台并发生成刚把新视频/新图片写回磁盘，而
+            # 客户端内存里还没有这条结果，直接整份覆盖就会把它吞掉。这里在锁内重新读取磁盘
+            # 上的生成结果做并集补齐（只增不减，删除仍走专门接口），避免生成结果丢失。
+            try:
+                on_disk = load_project(pid)
+            except Exception:
+                on_disk = None
+            if on_disk is not None:
+                merge_generated_media_preserve(data, on_disk)
             saved = save_project(pid, data)
             append_operation_log(saved["project_id"], "project_save", user_name="系统", stats=project_stats(saved))
         finally:
@@ -4851,7 +4938,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if cat not in GROUPED_CATEGORIES:
             self.send_json(400, {"error": "该分类不支持素材组"}); return
         name = normalize_group_name(body.get("name") or "", cat + "组")
-        data = load_project(pid)
+        data = self.begin_project_mutation(pid)
         ensure_asset_groups(data)
         if any(g.get("category") == cat and g.get("name", "").lower() == name.lower() for g in data.get("asset_groups", [])):
             self.send_json(400, {"error": "同一分类下已存在同名素材组"}); return
@@ -4866,7 +4953,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pid = safe_name(body.get("project") or "")
         gid = body.get("group_id") or ""
         name = normalize_group_name(body.get("new_name") or "", "素材组")
-        data = load_project(pid)
+        data = self.begin_project_mutation(pid)
         g = get_asset_group_by_id(data, gid)
         if not g:
             self.send_json(404, {"error": "素材组不存在"}); return
@@ -4881,7 +4968,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         body = self.read_body()
         pid = safe_name(body.get("project") or "")
         gid = body.get("group_id") or ""
-        data = load_project(pid)
+        data = self.begin_project_mutation(pid)
         g = get_asset_group_by_id(data, gid)
         if not g:
             self.send_json(404, {"error": "素材组不存在"}); return
@@ -4897,7 +4984,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pid = safe_name(body.get("project") or "")
         cat = body.get("category") or "人物"
         order = body.get("group_order") or []
-        data = load_project(pid)
+        data = self.begin_project_mutation(pid)
         ensure_asset_groups(data)
         rank = {gid: i + 1 for i, gid in enumerate(order)}
         for g in data.get("asset_groups", []):
@@ -4914,7 +5001,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         group_id = body.get("group_id") or ""
         if cat not in CATEGORIES:
             self.send_json(400, {"error": "invalid category"}); return
-        data = load_project(pid)
+        data = self.begin_project_mutation(pid)
         group = None
         raw, ext = parse_data_url(body.get("dataUrl") or "")
         requested_name = body.get("name") or Path(body.get("filename") or "素材").stem
@@ -4940,7 +5027,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         body = self.read_body()
         pid = safe_name(body.get("project") or "")
         asset_id = body.get("asset_id") or ""
-        data = load_project(pid)
+        data = self.begin_project_mutation(pid)
         remove_assets_by_ids(data, [asset_id])
         save_project(pid, data)
         append_operation_log(pid, "project_operation", stats=project_stats(data))
@@ -4951,7 +5038,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pid = safe_name(body.get("project") or "")
         asset_id = body.get("asset_id") or ""
         new_name = safe_file_name(body.get("new_name") or "", "素材")
-        data = load_project(pid)
+        data = self.begin_project_mutation(pid)
         target = get_asset_by_id(data, asset_id)
         old_asset_name = target.get("name") if target else ""
         if not target:
@@ -4993,7 +5080,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         group_id = body.get("group_id") or ""
         if cat not in CATEGORIES:
             self.send_json(400, {"error": "invalid category"}); return
-        data = load_project(pid)
+        data = self.begin_project_mutation(pid)
         ensure_asset_groups(data)
         group = None
         if cat in GROUPED_CATEGORIES:
@@ -5033,7 +5120,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         body = self.read_body()
         pid = safe_name(body.get("project") or "")
         ids = set(body.get("asset_ids") or [])
-        data = load_project(pid)
+        data = self.begin_project_mutation(pid)
         remove_assets_by_ids(data, ids)
         save_project(pid, data)
         self.send_json(200, {"ok": True, "data": data})
@@ -5043,7 +5130,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pid = safe_name(body.get("project") or "")
         shot_id = body.get("shot_id") or ""
         tab_id = body.get("tab_id") or None
-        data = load_project(pid)
+        data = self.begin_project_mutation(pid)
         scene, shot, tab = find_tab(data, shot_id, tab_id)
         raw, ext = parse_data_url(body.get("dataUrl") or "")
         requested_name = body.get("name") or Path(body.get("filename") or "临时素材").stem
@@ -5066,7 +5153,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def api_scene_add(self):
         body = self.read_body(); pid = safe_name(body.get("project") or "")
-        data = load_project(pid)
+        data = self.begin_project_mutation(pid)
         next_num = max_scene_number(data.get("scenes", [])) + 1
         s = make_scene(len(data.get("scenes", [])) + 1, next_num)
         s["shots"].append(make_shot(1, data.get("project_settings")))
@@ -5076,7 +5163,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def api_scene_insert(self):
         body = self.read_body(); pid = safe_name(body.get("project") or "")
-        data = load_project(pid)
+        data = self.begin_project_mutation(pid)
         next_num = max_scene_number(data.get("scenes", [])) + 1
         s = make_scene(len(data.get("scenes", [])) + 1, next_num)
         s["shots"].append(make_shot(1, data.get("project_settings")))
@@ -5090,7 +5177,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         new_number = parse_positive_int(body.get("scene_number"), None)
         if new_number is None:
             self.send_json(400, {"error": "SC 编号只能填写大于 0 的数字"}); return
-        data = load_project(pid)
+        data = self.begin_project_mutation(pid)
         target = None
         for scene in data.get("scenes", []):
             if scene.get("scene_id") == scene_id:
@@ -5107,7 +5194,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def api_scene_delete(self):
         body = self.read_body(); pid = safe_name(body.get("project") or "")
         scene_id = body.get("scene_id") or ""
-        data = load_project(pid)
+        data = self.begin_project_mutation(pid)
         target_code = None
         keep = []
         for s in data.get("scenes", []):
@@ -5126,7 +5213,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def api_shot_add(self):
         body = self.read_body(); pid = safe_name(body.get("project") or "")
         scene_id = body.get("scene_id") or ""
-        data = load_project(pid)
+        data = self.begin_project_mutation(pid)
         scene = find_scene(data, scene_id)
         scene.setdefault("shots", []).append(make_shot(len(scene.get("shots", [])) + 1, data.get("project_settings")))
         save_project(pid, data)
@@ -5135,7 +5222,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def api_shot_insert(self):
         body = self.read_body(); pid = safe_name(body.get("project") or "")
         scene_id = body.get("scene_id") or ""; after_id = body.get("after_shot_id")
-        data = load_project(pid); scene = find_scene(data, scene_id)
+        data = self.begin_project_mutation(pid); scene = find_scene(data, scene_id)
         shots = scene.get("shots", [])
         idx = 0
         if after_id:
@@ -5150,7 +5237,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def api_shot_delete(self):
         body = self.read_body(); pid = safe_name(body.get("project") or "")
         shot_id = body.get("shot_id") or ""
-        data = load_project(pid)
+        data = self.begin_project_mutation(pid)
         for scene in data.get("scenes", []):
             shots = scene.get("shots", [])
             target = None
@@ -5171,7 +5258,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def api_shot_reorder(self):
         body = self.read_body(); pid = safe_name(body.get("project") or "")
         scene_id = body.get("scene_id") or ""; order = body.get("shot_order") or []
-        data = load_project(pid); scene = find_scene(data, scene_id)
+        data = self.begin_project_mutation(pid); scene = find_scene(data, scene_id)
         by_id = {s.get("shot_id"): s for s in scene.get("shots", [])}
         new_shots = [by_id[i] for i in order if i in by_id]
         for s in scene.get("shots", []):
@@ -5232,13 +5319,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if assets_text:
                     reply += f" 当前已引用素材有：{assets_text}。"
                 reply += "你可以继续补充人物、构图、镜头、风格等要求；如果描述已经清楚，也可以直接发送让系统开始生图。"
-            latest = load_project(pid)
-            scene2, shot2, tab2, user_msg_id = apply_user_message_for_submit(latest, shot.get("shot_id"), tab.get("tab_id"), user_text, redo_id)
-            tab2.setdefault("messages", []).append({"message_id": new_id("msg"), "role": "assistant", "content": reply, "time": now_str(), "kind": "chat", "reply_to_message_id": user_msg_id})
-            update_context_summary(tab2, user_text)
-            usage = record_usage(user_name, "chat", CHAT_MODEL, tokens, pid, shot2.get("shot_id"), tab2.get("tab_id"), scene=scene2, shot=shot2) if tokens else get_user_usage(user_name)
-            append_operation_log(pid, "chat_submit", user_name=user_name, scene_code=scene2.get("scene_code"), shot_code=shot2.get("shot_code"), shot_id=shot2.get("shot_id"), tab_id=tab2.get("tab_id"), message=user_text)
-            save_project(pid, latest)
+            # 锁内“重新读取->追加消息->保存”，避免与并发生成/结构操作互相覆盖吞结果。
+            _lock = project_mutation_lock(pid)
+            _lock.acquire()
+            try:
+                latest = load_project(pid)
+                scene2, shot2, tab2, user_msg_id = apply_user_message_for_submit(latest, shot.get("shot_id"), tab.get("tab_id"), user_text, redo_id)
+                tab2.setdefault("messages", []).append({"message_id": new_id("msg"), "role": "assistant", "content": reply, "time": now_str(), "kind": "chat", "reply_to_message_id": user_msg_id})
+                update_context_summary(tab2, user_text)
+                usage = record_usage(user_name, "chat", CHAT_MODEL, tokens, pid, shot2.get("shot_id"), tab2.get("tab_id"), scene=scene2, shot=shot2) if tokens else get_user_usage(user_name)
+                append_operation_log(pid, "chat_submit", user_name=user_name, scene_code=scene2.get("scene_code"), shot_code=shot2.get("shot_code"), shot_id=shot2.get("shot_id"), tab_id=tab2.get("tab_id"), message=user_text)
+                save_project(pid, latest)
+            finally:
+                _lock.release()
             self.send_json(200, {"ok": True, "data": latest, "reply": reply, "used_mock": not bool(api_key), "mode": "chat", "usage": usage})
         except Exception as e:
             self.send_json(500, {"error": str(e), "data": load_project(pid), "usage": get_user_usage(user_name)})
@@ -5299,17 +5392,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "prompt": prompt, "settings": dict(settings), "source_message_id": None,
                 "tab_id": tab.get("tab_id"),
             }
-            latest = load_project(pid)
-            scene2, shot2, tab2, user_msg_id = apply_user_message_for_submit(latest, shot.get("shot_id"), tab.get("tab_id"), user_text, redo_id)
-            img["source_message_id"] = user_msg_id
-            tab2.setdefault("generated_images", []).append(img)
-            tab2["current_base_image_id"] = img["image_id"]
-            update_context_summary(tab2, latest_text)
-            tab2.setdefault("messages", []).append({"message_id": new_id("msg"), "role": "assistant", "content": "已生成 1 张图片。", "time": now_str(), "operation": operation, "kind": "generate", "image_id": img["image_id"], "reply_to_message_id": user_msg_id})
-            usage = record_usage(user_name, "image", model, tokens, pid, shot2.get("shot_id"), tab2.get("tab_id"), scene=scene2, shot=shot2) if tokens else get_user_usage(user_name)
-            append_operation_log(pid, "image_generate_success", user_name=user_name, scene_code=scene2.get("scene_code"), shot_code=shot2.get("shot_code"), shot_id=shot2.get("shot_id"), tab_id=tab2.get("tab_id"), prompt=latest_text, output_path=img.get("file_path"), image_id=img.get("image_id"), operation=operation, model=model)
-            create_project_snapshot(pid, "image_generate_success", data=latest, user_name=user_name)
-            save_project(pid, latest)
+            # 锁内“重新读取->追加生成结果->保存”，避免与并发生成/结构操作互相覆盖吞结果。
+            _lock = project_mutation_lock(pid)
+            _lock.acquire()
+            try:
+                latest = load_project(pid)
+                scene2, shot2, tab2, user_msg_id = apply_user_message_for_submit(latest, shot.get("shot_id"), tab.get("tab_id"), user_text, redo_id)
+                img["source_message_id"] = user_msg_id
+                tab2.setdefault("generated_images", []).append(img)
+                tab2["current_base_image_id"] = img["image_id"]
+                update_context_summary(tab2, latest_text)
+                tab2.setdefault("messages", []).append({"message_id": new_id("msg"), "role": "assistant", "content": "已生成 1 张图片。", "time": now_str(), "operation": operation, "kind": "generate", "image_id": img["image_id"], "reply_to_message_id": user_msg_id})
+                usage = record_usage(user_name, "image", model, tokens, pid, shot2.get("shot_id"), tab2.get("tab_id"), scene=scene2, shot=shot2) if tokens else get_user_usage(user_name)
+                append_operation_log(pid, "image_generate_success", user_name=user_name, scene_code=scene2.get("scene_code"), shot_code=shot2.get("shot_code"), shot_id=shot2.get("shot_id"), tab_id=tab2.get("tab_id"), prompt=latest_text, output_path=img.get("file_path"), image_id=img.get("image_id"), operation=operation, model=model)
+                create_project_snapshot(pid, "image_generate_success", data=latest, user_name=user_name)
+                save_project(pid, latest)
+            finally:
+                _lock.release()
             self.send_json(200, {"ok": True, "data": latest, "image": img, "used_mock": not bool(api_key), "mode": "generate", "usage": usage})
         except Exception as e:
             self.send_json(500, {"error": str(e), "data": load_project(pid), "usage": get_user_usage(user_name)})
@@ -5499,7 +5598,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         shot_id = body.get("shot_id") or ""
         round_no = parse_positive_int(body.get("round"), 1) or 1
         round_no = min(max(round_no, 1), 3)
-        data = load_project(pid)
+        data = self.begin_project_mutation(pid)
         scene, shot = find_shot(data, shot_id)
         if scene_id and scene.get("scene_id") != scene_id:
             self.send_json(400, {"error": "scene and shot mismatch"}); return
@@ -5532,7 +5631,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         ids = body.get("image_ids") or []
         if isinstance(ids, str):
             ids = [ids]
-        data = load_project(pid)
+        data = self.begin_project_mutation(pid)
         deleted = delete_generated_images_by_ids(data, ids, delete_files=True)
         save_project(pid, data)
         self.send_json(200, {"ok": True, "deleted": deleted, "data": data})
@@ -5542,7 +5641,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pid = safe_name(body.get("project") or "")
         image_id = body.get("image_id") or ""
         new_name = body.get("new_name") or "图片"
-        data = load_project(pid)
+        data = self.begin_project_mutation(pid)
         final_name, old_name, new_url = rename_generated_image_by_id(data, image_id, new_name)
         if not final_name:
             self.send_json(404, {"error": "image not found"}); return
@@ -5587,7 +5686,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pid = safe_name(body.get("project") or "")
         shot_id = body.get("shot_id") or ""
         image_id = body.get("image_id") or ""
-        data = load_project(pid)
+        data = self.begin_project_mutation(pid)
         scene, shot = find_shot(data, shot_id)
         removed = False
         for tab in shot.get("tabs", []):
@@ -5609,7 +5708,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def api_storyboard_add(self):
         body = self.read_body(); pid = safe_name(body.get("project") or "")
         shot_id = body.get("shot_id") or ""; image_id = body.get("image_id") or ""
-        data = load_project(pid); scene, shot = find_shot(data, shot_id)
+        data = self.begin_project_mutation(pid); scene, shot = find_shot(data, shot_id)
         _tab, img = find_generated_image_in_shot(shot, image_id)
         if not img:
             self.send_json(404, {"error": "image not found"}); return
@@ -5622,7 +5721,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def api_storyboard_upload(self):
         body = self.read_body(); pid = safe_name(body.get("project") or "")
         shot_id = body.get("shot_id") or ""; tab_id = body.get("tab_id") or None
-        data = load_project(pid); scene, shot, tab = find_tab(data, shot_id, tab_id)
+        data = self.begin_project_mutation(pid); scene, shot, tab = find_tab(data, shot_id, tab_id)
         raw, ext = parse_data_url(body.get("dataUrl") or "")
         name = safe_file_name(body.get("name") or Path(body.get("filename") or "分镜图").stem, "分镜图")
         media_is_video = ext.lower() in (".mp4", ".mov", ".webm", ".m4v")
@@ -5644,7 +5743,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def api_storyboard_remove(self):
         body = self.read_body(); pid = safe_name(body.get("project") or "")
         shot_id = body.get("shot_id") or ""; image_id = body.get("image_id") or ""
-        data = load_project(pid); scene, shot = find_shot(data, shot_id)
+        data = self.begin_project_mutation(pid); scene, shot = find_shot(data, shot_id)
         shot["storyboard_candidates"] = [c for c in shot.get("storyboard_candidates", []) if c.get("image_id") != image_id]
         if not shot["storyboard_candidates"]:
             shot["status"] = "unconfirmed"

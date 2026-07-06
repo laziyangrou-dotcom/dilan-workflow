@@ -1890,7 +1890,7 @@ class Handler(BaseHTTPRequestHandler):
 def run():
     httpd=ThreadingHTTPServer(('127.0.0.1',PORT),Handler)
     url=f'http://127.0.0.1:{PORT}/'
-    print('帝蓝工作流-统一审核端 V41 已启动：',url)
+    print('帝蓝工作流-统一审核端 V42 已启动：',url)
     threading.Timer(0.8,lambda:webbrowser.open(url)).start()
     httpd.serve_forever()
 
