@@ -815,6 +815,13 @@ def merge_generated_media_preserve(client_data, disk_data):
         if added:
             msgs.sort(key=lambda mm: str(mm.get("time") or "") if isinstance(mm, dict) else "")
         tab["messages"] = msgs
+        # 运行状态兜底（与前端 adoptProject 一致）：整份覆盖保存不得把磁盘上已完成(success/error)
+        # 的视频状态退回“生成中”。真正的新生成会由生成接口直接把 running 写盘，不依赖这条整份保存，
+        # 故当磁盘已是终态、而客户端快照仍是 running/缺省时，以磁盘终态为准，避免刷新后假“生成中”。
+        _dst = (dtab.get("last_video_status") or {}).get("state")
+        _cst = (tab.get("last_video_status") or {}).get("state")
+        if _dst in ("success", "error") and _cst in ("running", "submitting", "polling", None):
+            tab["last_video_status"] = dtab.get("last_video_status")
 
 
 def operation_log_path(pid):
