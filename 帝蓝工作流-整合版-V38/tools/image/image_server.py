@@ -4864,7 +4864,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         result = import_project_package(body.get("dataUrl") or "", body.get("filename") or "", body.get("user_name") or "", body.get("target_parent") or body.get("parent") or "")
         self.send_json(200, {"ok": True, **result})
 
-    # ---- 数据中心接入（V44） ----
+    # ---- 数据中心接入 ----
     def _dc_shared_dir(self):
         return SHARED_PROJECT_INDEX_DIR
 
