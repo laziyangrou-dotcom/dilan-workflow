@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-帝蓝工作流整合版 V46
-- 统一入口： http://127.0.0.1:8787/material、/image 或 /video
-- 素材、图片、视频工具作为三个独立子服务运行，核心代码互不合并。
+帝蓝工作流整合版 V47
+- 统一入口： http://127.0.0.1:8787/material 或 /video
+- 美术、视频工具作为两个独立子服务运行，核心代码互不合并。
 """
 import atexit
 import base64
@@ -26,10 +26,8 @@ from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent
 MATERIAL_DIR = ROOT / "tools" / "material"
-IMAGE_DIR = ROOT / "tools" / "image"
 VIDEO_DIR = ROOT / "tools" / "video"
 MATERIAL_PORT = int(os.environ.get("DILAN_MATERIAL_PORT", "8790"))
-IMAGE_PORT = int(os.environ.get("DILAN_IMAGE_PORT", "8788"))
 VIDEO_PORT = int(os.environ.get("DILAN_VIDEO_PORT", "8789"))
 GATEWAY_PORT = int(os.environ.get("DILAN_GATEWAY_PORT", "8787"))
 
@@ -98,17 +96,13 @@ def pick_tool_from_referer(headers) -> str:
         return "material"
     if path.startswith("/video"):
         return "video"
-    if path.startswith("/image"):
-        return "image"
     return "material"
 
 
 def upstream_for_tool(tool: str):
-    if tool == "material":
-        return MATERIAL_PORT
     if tool == "video":
         return VIDEO_PORT
-    return IMAGE_PORT
+    return MATERIAL_PORT
 
 
 def decode_import_data_url(data_url: str) -> bytes:
@@ -145,7 +139,7 @@ def sniff_import_package_module(body: bytes) -> str:
                 if project_json:
                     project_data = read_zip_json(zf, project_json) or {}
                     module_type = str(project_data.get("module_type") or project_data.get("project_module_type") or "").strip()
-            return module_type if module_type in {"material", "image", "video"} else ""
+            return module_type if module_type in {"material", "video"} else ""
     except Exception as e:
         print(f"[gateway] 工程包模块识别失败，将按当前页面模块导入：{e}")
         return ""
@@ -161,7 +155,7 @@ def set_user_env_var_windows(name: str, value: str):
 
 
 class GatewayHandler(http.server.BaseHTTPRequestHandler):
-    server_version = "DilanIntegratedV46/1.0"
+    server_version = "DilanIntegratedV47/1.0"
 
     def log_message(self, fmt, *args):
         print("[gateway]", self.address_string(), "-", fmt % args)
@@ -265,9 +259,6 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         elif raw_path == "/video" or raw_path.startswith("/video/"):
             tool = "video"
             upstream_path = raw_path[len("/video"):] or "/"
-        elif raw_path == "/image" or raw_path.startswith("/image/"):
-            tool = "image"
-            upstream_path = raw_path[len("/image"):] or "/"
         elif raw_path.startswith(("/api/", "/input/", "/output/", "/temp/")):
             tool = pick_tool_from_referer(self.headers)
             upstream_path = raw_path
@@ -280,7 +271,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(404, "not found")
             return
 
-        # Normalise /material, /video and /image to each child tool's root page.
+        # Normalise /material and /video to each child tool's root page.
         if upstream_path in ("", "/"):
             upstream_path = "/"
 
@@ -418,10 +409,9 @@ def handle_exit_signal(signum, frame):
 
 def main():
     print("============================================")
-    print("帝蓝工作流整合版 V46")
+    print("帝蓝工作流整合版 V47")
     print("统一入口: http://127.0.0.1:%s/material" % GATEWAY_PORT)
     print("素材子服务: http://127.0.0.1:%s" % MATERIAL_PORT)
-    print("图片子服务: http://127.0.0.1:%s" % IMAGE_PORT)
     print("视频子服务: http://127.0.0.1:%s" % VIDEO_PORT)
     print("============================================")
     atexit.register(cleanup_children)
@@ -432,7 +422,6 @@ def main():
             except Exception:
                 pass
     start_child("美术", MATERIAL_DIR, MATERIAL_PORT)
-    start_child("分镜", IMAGE_DIR, IMAGE_PORT)
     start_child("视频", VIDEO_DIR, VIDEO_PORT)
     server = http.server.ThreadingHTTPServer(("127.0.0.1", GATEWAY_PORT), GatewayHandler)
     url = f"http://127.0.0.1:{GATEWAY_PORT}/material"

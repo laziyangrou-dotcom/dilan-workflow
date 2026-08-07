@@ -1,1 +1,0 @@
-# 数据中心仅使用 Python 标准库（http.server + sqlite3），无需第三方依赖。

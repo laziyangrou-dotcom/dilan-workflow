@@ -1,2 +1,0 @@
-# No third-party dependencies are required in this edition.
-# The backend uses only Python standard library.

@@ -48,16 +48,15 @@ PROJECT_MODULE_TYPE = "video"
 PROJECT_MODULE_LABEL = "视频模块"
 PROJECT_PACKAGE_TYPE = "dilan_project_package"
 LEGACY_PROJECT_PACKAGE_TYPE = "image_storyboard_child_project_full"
-PROJECT_MODULE_LABELS = {"material": "美术模块", "image": "分镜模块", "video": "视频模块"}
+PROJECT_MODULE_LABELS = {"material": "美术模块", "video": "视频模块"}
 ROOT = Path(__file__).resolve().parent
 SHARED_PROJECT_INDEX_DIR = ROOT.parent.parent / "shared_project_index"
 SHARED_PARENTS_JSON = SHARED_PROJECT_INDEX_DIR / "parents.json"
 import sys as _sys
 if str(ROOT.parent) not in _sys.path:
     _sys.path.insert(0, str(ROOT.parent))
-import datacenter_common as dcc
-PROJECT_MODULE_KEYS = ["material", "image", "video"]
-PROJECT_MODULE_UI_LABELS = {"material": "美术", "image": "分镜", "video": "视频"}
+PROJECT_MODULE_KEYS = ["material", "video"]
+PROJECT_MODULE_UI_LABELS = {"material": "美术", "video": "视频"}
 PROJECTS_DIR = ROOT / "projects"
 INPUT_DIR = ROOT / "input"
 OUTPUT_DIR = ROOT / "output"
@@ -2196,7 +2195,7 @@ def build_usage_summary(project_data, responsible_nickname):
         "hidden_deleted_or_unassigned_usage": hidden,
         "notes": [
             "by_sc 只包含当前 project.json 中仍存在的 SC，适合普通审核界面展示。",
-            "hidden_deleted_or_unassigned_usage 保存已删除 SC 或无法映射费用事件，不默认外显，但用于后期审核端查账。",
+            "hidden_deleted_or_unassigned_usage 保存已删除 SC 或无法映射费用事件，不默认外显，仅供后期查账。",
             "费用来自制作端 usage.json 记录；图片接口无官方 usage 时使用工具内估算规则。",
         ],
     }
@@ -2208,7 +2207,6 @@ def collect_project_export_files(project_data):
     file_map = {}
     # Main project-related directories. Keep original relative paths so future import can restore easily.
     add_dir_files(file_map, project_path(pid) / "temp_refs", "temp_refs")
-    add_dir_files(file_map, project_path(pid) / "review_notes", "review_notes")
     add_dir_files(file_map, INPUT_DIR / storage, "input_assets")
     add_dir_files(file_map, OUTPUT_IMAGE_DIR / storage, "output_images")
     add_dir_files(file_map, OUTPUT_VIDEO_DIR / storage, "output_videos")
@@ -2221,10 +2219,6 @@ def collect_project_export_files(project_data):
         for shot in scene.get("shots", []) or []:
             for c in shot.get("storyboard_candidates", []) or []:
                 refs.append((c.get("file_path"), "storyboard_candidate"))
-            for note in (shot.get("review_notes_by_round") or {}).values():
-                if isinstance(note, dict):
-                    for img in note.get("images", []) or []:
-                        refs.append((img.get("file_path"), "review_note_image"))
             for tab in shot.get("tabs", []) or []:
                 for img in tab.get("generated_images", []) or []:
                     refs.append((img.get("file_path"), "generated_image"))
@@ -2246,14 +2240,10 @@ def count_project_items(project_data):
     tab_count = 0
     generated_image_count = 0
     storyboard_candidate_count = 0
-    review_note_image_count = 0
     for scene in scenes:
         for shot in scene.get("shots", []) or []:
             shot_count += 1
             storyboard_candidate_count += len(shot.get("storyboard_candidates", []) or [])
-            for note in (shot.get("review_notes_by_round") or {}).values():
-                if isinstance(note, dict):
-                    review_note_image_count += len(note.get("images", []) or [])
             for tab in shot.get("tabs", []) or []:
                 tab_count += 1
                 generated_image_count += len(tab.get("generated_images", []) or [])
@@ -2264,7 +2254,6 @@ def count_project_items(project_data):
         "asset_count": len(project_data.get("assets", []) or []),
         "generated_image_count": generated_image_count,
         "storyboard_candidate_count": storyboard_candidate_count,
-        "review_note_image_count": review_note_image_count,
     }
 
 
@@ -2402,7 +2391,6 @@ def create_project_export_zip(project_id, responsible_nickname):
         "output_image_root": f"output/image/{safe_name(pid, 'project')}/",
         "output_video_root": f"output/video/{safe_name(pid, 'project')}/",
         "temp_refs_root": root_relative_arcname(project_path(pid) / "temp_refs"),
-        "review_notes_root": root_relative_arcname(project_path(pid) / "review_notes"),
         **item_counts,
         "usage_summary": {
             "currency": "USD",
@@ -3008,190 +2996,6 @@ def write_zip_member_to(zf: zipfile.ZipFile, info: zipfile.ZipInfo, dest: Path):
 
 
 
-def _all_review_holders(data):
-    """返回所有可能挂有 review_notes_by_round 的对象（场景/命名框 + 其下子栏），兼容美术三套工作台。"""
-    holders = []
-    wss = data.get("material_workspaces") if isinstance(data.get("material_workspaces"), dict) else {}
-    scenes = []
-    for key in ("character", "scene", "object"):
-        ws = wss.get(key) or {}
-        for s in (ws.get("scenes") or []):
-            scenes.append(s)
-    for s in (data.get("scenes") or []):
-        scenes.append(s)
-    for s in scenes:
-        holders.append(s)
-        for sh in (s.get("shots") or []):
-            holders.append(sh)
-    return holders
-
-
-def _note_round_span(holder):
-    """返回该对象涉及的轮次列表 1..N（综合 review_notes_by_round 与 review.rounds / current_round）。"""
-    keys = set()
-    rnv = holder.get("review_notes_by_round")
-    if isinstance(rnv, dict):
-        for k in rnv.keys():
-            try: keys.add(int(k))
-            except Exception: pass
-    rv = holder.get("review")
-    if isinstance(rv, dict):
-        try: keys.add(int(rv.get("current_round") or 1))
-        except Exception: pass
-        rounds = rv.get("rounds")
-        if isinstance(rounds, dict):
-            for k in rounds.keys():
-                try: keys.add(int(k))
-                except Exception: pass
-    if not keys:
-        keys = {1}
-    return list(range(1, max(keys) + 1))
-
-
-def _ensure_note_slot(holder, r):
-    nbr = holder.setdefault("review_notes_by_round", {})
-    slot = nbr.get(str(r))
-    if not isinstance(slot, dict):
-        slot = {"text": "", "images": [], "active_index": 0}
-        nbr[str(r)] = slot
-    slot.setdefault("text", "")
-    slot.setdefault("images", [])
-    slot.setdefault("active_index", 0)
-    return slot
-
-
-def _review_round_note_text(holder, r):
-    rv = holder.get("review")
-    if isinstance(rv, dict):
-        rounds = rv.get("rounds")
-        if isinstance(rounds, dict):
-            rd = rounds.get(str(r))
-            if isinstance(rd, dict) and rd.get("note"):
-                return rd.get("note")
-    return ""
-
-
-def _norm_note_image(im):
-    if not isinstance(im, dict):
-        return None
-    out = dict(im)
-    if not out.get("file_path") and out.get("path"):
-        out["file_path"] = out["path"]
-    if not out.get("file_path"):
-        return None
-    out.setdefault("note_image_id", new_id("noteimg"))
-    out.setdefault("name", Path(str(out.get("file_path"))).stem or "审核备注图")
-    return out
-
-
-def reconcile_review_notes_for_import(data, from_review):
-    """统一审核备注，逐轮独立、互不继承：
-      1) 每个轮次文字字段归一：review.rounds[r].note -> review_notes_by_round[r].text；
-      2) from_review=True（来自统一审核端的包）时，把 SC/命名框(scene)层每个轮次的备注
-         镜像到其各子栏(shot)的同一轮次，仅当子栏该轮无备注时填充（不覆盖、不跨轮继承），
-         使制作端按 shot 逐轮读取时都能看到。幂等。"""
-    scenes = []
-    wss = data.get("material_workspaces") if isinstance(data.get("material_workspaces"), dict) else {}
-    for key in ("character", "scene", "object"):
-        for s in (wss.get(key) or {}).get("scenes") or []:
-            scenes.append(s)
-    for s in (data.get("scenes") or []):
-        scenes.append(s)
-
-    def rounds_present(holder):
-        ks = set()
-        nbr = holder.get("review_notes_by_round")
-        if isinstance(nbr, dict):
-            for k in nbr.keys():
-                ks.add(str(k))
-        rv = holder.get("review")
-        if isinstance(rv, dict) and isinstance(rv.get("rounds"), dict):
-            for k in rv["rounds"].keys():
-                ks.add(str(k))
-        return ks
-
-    def unify(holder):
-        for r in rounds_present(holder):
-            slot = _ensure_note_slot(holder, r)
-            if not slot.get("text"):
-                t = _review_round_note_text(holder, r)
-                if t:
-                    slot["text"] = t
-            slot["images"] = [x for x in (_norm_note_image(im) for im in slot.get("images") or []) if x]
-
-    for sc in scenes:
-        unify(sc)
-        for sh in (sc.get("shots") or []):
-            unify(sh)
-            if from_review:
-                for r in rounds_present(sc):
-                    scslot = _ensure_note_slot(sc, r)
-                    shslot = _ensure_note_slot(sh, r)
-                    if not shslot.get("text") and not shslot.get("images"):
-                        if scslot.get("text"):
-                            shslot["text"] = scslot["text"]
-                        if scslot.get("images"):
-                            shslot["images"] = [dict(im) for im in scslot["images"]]
-                        shslot["active_index"] = 0
-
-
-def normalize_review_note_paths(data, new_pid):
-    """把审核备注图的 file_path 统一改写为本端可服务的 /temp/<项目>/review_notes/<尾巴> 形式，
-    兼容审核端扁平路径(review_notes/xxx)与制作端原有的 /temp/.../review_notes/... 形式，
-    保证审核端→数据中心→制作端下载后备注图可正常显示、两端审核备注互通。"""
-    prefix = project_temp_public_prefix(new_pid)
-    for holder in _all_review_holders(data):
-        nbr = holder.get("review_notes_by_round")
-        if not isinstance(nbr, dict):
-            continue
-        for slot in nbr.values():
-            if not isinstance(slot, dict):
-                continue
-            for im in (slot.get("images") or []):
-                if not isinstance(im, dict):
-                    continue
-                fp = str(im.get("file_path") or im.get("path") or "")
-                if not fp:
-                    continue
-                if "review_notes/" in fp:
-                    tail = fp.split("review_notes/")[-1].split("?")[0].lstrip("/")
-                else:
-                    tail = Path(fp).name
-                if tail:
-                    im["file_path"] = f"{prefix}/review_notes/{tail}"
-
-
-def compact_review_round_snapshots(project_data):
-    """Strip heavy duplicated review round shot snapshots from imported reviewed packages.
-    覆盖顶层 scenes 与美术 material_workspaces 下的 scenes，避免制作端切换审核轮次时
-    用旧的 round 快照整体覆盖掉 scene.shots（含审核端后加的逐轮备注/备注图）。
-    Review results/times stay in review.rounds; current scene.shots remains the editable/display copy.
-    """
-    removed = 0
-    scenes = []
-    wss = project_data.get("material_workspaces") if isinstance(project_data.get("material_workspaces"), dict) else {}
-    for key in ("character", "scene", "object"):
-        for s in (wss.get(key) or {}).get("scenes") or []:
-            scenes.append(s)
-    for s in project_data.get("scenes", []) or []:
-        scenes.append(s)
-    for scene in scenes:
-        review = scene.get("review")
-        if not isinstance(review, dict):
-            continue
-        rounds = review.get("rounds")
-        if not isinstance(rounds, dict):
-            continue
-        for r in rounds.values():
-            if isinstance(r, dict) and isinstance(r.get("shots"), list):
-                removed += len(r.get("shots") or [])
-                r.pop("shots", None)
-                r["shots_snapshot_compacted"] = True
-    if removed:
-        project_data.setdefault("import_info", {})
-        project_data["import_info"]["review_round_shots_compacted"] = True
-        project_data["import_info"]["compacted_review_shot_count"] = removed
-    return project_data
 def package_module_label(module_type):
     return PROJECT_MODULE_LABELS.get(str(module_type or "").strip(), str(module_type or "未知模块") or "未知模块")
 
@@ -3240,6 +3044,8 @@ def import_project_package_into_module(module_type, zip_path, filename="", impor
     module_type = str(module_type or "").strip()
     if module_type == PROJECT_MODULE_TYPE:
         raise ValueError("工程包已经属于当前模块，无需转发导入")
+    if module_type == "image":
+        raise ValueError("分镜模块已从本工作流移除，无法导入分镜工程包")
     if module_type not in PROJECT_MODULE_KEYS:
         raise ValueError(f"未知工程包模块：{module_type or '空'}")
     target_script = ROOT.parent / module_type / "image_server.py"
@@ -3406,7 +3212,6 @@ def import_project_package_from_zip_path(zip_path, filename="", importer_name=""
         output_prefix = f"output/image/{old_storage}/"
         output_video_prefix = f"output/video/{old_storage}/"
         temp_prefix = f"projects/{old_parent}/children/{old_child}/temp_refs/"
-        review_prefix = f"projects/{old_parent}/children/{old_child}/review_notes/"
         copied_files = 0
         for arc, info in members:
             if arc in {"manifest.json", "export_info.json", "usage_summary.json", project_json_arc, parent_json_arc}:
@@ -3427,16 +3232,6 @@ def import_project_package_from_zip_path(zip_path, filename="", importer_name=""
                 rel = arc[len(temp_prefix):]
                 write_zip_member_to(zf, info, project_path(new_pid) / "temp_refs" / rel)
                 copied_files += 1
-            elif arc.startswith(review_prefix):
-                rel = arc[len(review_prefix):]
-                write_zip_member_to(zf, info, project_path(new_pid) / "review_notes" / rel)
-                copied_files += 1
-            elif arc.startswith("review_notes/") or "/review_notes/" in arc:
-                # 兼容审核端扁平形式(review_notes/xxx)及其它来源；按最后一个 review_notes/ 之后归位
-                rel = arc.split("review_notes/")[-1].lstrip("/")
-                if rel:
-                    write_zip_member_to(zf, info, project_path(new_pid) / "review_notes" / rel)
-                    copied_files += 1
 
         project_path(new_pid).mkdir(parents=True, exist_ok=True)
         meta_dir = project_path(new_pid) / "imported_package_meta"
@@ -3457,9 +3252,6 @@ def import_project_package_from_zip_path(zip_path, filename="", importer_name=""
             "copied_files": copied_files,
         }, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        reconcile_review_notes_for_import(project_data, from_review=bool((manifest or {}).get("reviewed_by_unified_client")))
-        normalize_review_note_paths(project_data, new_pid)
-        compact_review_round_snapshots(project_data)
         normalize_project(project_data, rename_dirs=False)
         write_json_file(project_json_path(new_pid), project_data)
         return {
@@ -4427,12 +4219,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_file(ROOT / "index.html", "text/html; charset=utf-8")
             elif path == "/api/config":
                 self.send_json(200, load_config())
-            elif path == "/api/datacenter/config":
-                self.api_datacenter_config_get()
-            elif path == "/api/datacenter/projects":
-                self.api_datacenter_projects()
-            elif path.startswith("/api/datacenter/preview/"):
-                self.api_datacenter_preview(path.rsplit("/", 1)[-1])
             elif path == "/api/parents":
                 self.api_parents()
             elif path == "/api/projects":
@@ -4508,26 +4294,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.api_project_import_stream()
             elif path == "/api/project/merge":
                 self.api_project_merge()
-            elif path == "/api/datacenter/config/save":
-                self.api_datacenter_config_save()
-            elif path == "/api/datacenter/upload":
-                self.api_datacenter_upload()
-            elif path == "/api/datacenter/resolve-conflict":
-                self.api_datacenter_resolve_conflict()
-            elif path == "/api/datacenter/download-child":
-                self.api_datacenter_download_child()
-            elif path == "/api/datacenter/download-parent":
-                self.api_datacenter_download_parent()
-            elif path == "/api/datacenter/merge":
-                self.api_datacenter_merge()
-            elif path == "/api/datacenter/delete-child":
-                self.api_datacenter_delete_child()
             elif path == "/api/assets/package/import":
                 self.api_asset_package_import()
             elif path == "/api/assets/package/import/stream":
                 self.api_asset_package_import_stream()
-            elif path == "/api/review/note_image_upload":
-                self.api_review_note_image_upload()
             elif path == "/api/user/set_name":
                 self.api_user_set_name()
             elif path == "/api/assets/upload":
@@ -4788,111 +4558,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         body = self.read_body()
         result = import_project_package(body.get("dataUrl") or "", body.get("filename") or "", body.get("user_name") or "", body.get("target_parent") or body.get("parent") or "")
         self.send_json(200, {"ok": True, **result})
-
-    # ---- 数据中心接入 ----
-    def _dc_shared_dir(self):
-        return SHARED_PROJECT_INDEX_DIR
-
-    def api_datacenter_preview(self, child_id):
-        try:
-            raw = dcc.preview_bytes(self._dc_shared_dir(), child_id)
-            ext = "png"
-            ctype = "image/png"
-            self.send_response(200)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(raw)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(raw)
-        except Exception as e:
-            self.send_json(404, {"error": str(e)})
-
-    def api_datacenter_config_get(self):
-        self.send_json(200, dcc.load_dc_config(self._dc_shared_dir()))
-
-    def api_datacenter_config_save(self):
-        body = self.read_body()
-        self.send_json(200, dcc.save_dc_config(self._dc_shared_dir(), body.get("url") or ""))
-
-    def api_datacenter_projects(self):
-        try:
-            self.send_json(200, dcc.list_projects(self._dc_shared_dir()))
-        except Exception as e:
-            self.send_json(502, {"error": str(e)})
-
-    def api_datacenter_upload(self):
-        body = self.read_body()
-        pid = safe_name(body.get("project") or "")
-        user_name = normalize_user_name(body.get("user_name") or "未命名用户")
-        on_conflict = body.get("on_conflict") or "ask"
-        if not pid:
-            self.send_json(400, {"error": "missing project"}); return
-        try:
-            zip_path, manifest = create_project_export_zip(pid, user_name)
-            zip_bytes = Path(zip_path).read_bytes()
-            meta = {
-                "package_id": manifest.get("source_project_id") or pid,
-                "parent_id": manifest.get("parent_id") or "",
-                "parent_name": manifest.get("parent_name") or "",
-                "module_type": manifest.get("module_type") or PROJECT_MODULE_TYPE,
-                "module_label": manifest.get("module_label") or PROJECT_MODULE_LABEL,
-                "child_id": manifest.get("child_id") or "",
-                "child_name": manifest.get("child_name") or manifest.get("project_name") or pid,
-                "base_child_name": manifest.get("child_name") or manifest.get("project_name") or pid,
-                "generator_name": user_name,
-                "client_type": "creator",
-            }
-            result = dcc.upload_package(self._dc_shared_dir(), zip_bytes, Path(zip_path).name, meta, on_conflict=on_conflict)
-            self.send_json(200, result)
-        except Exception as e:
-            self.send_json(502, {"error": str(e)})
-
-    def api_datacenter_resolve_conflict(self):
-        body = self.read_body()
-        try:
-            self.send_json(200, dcc.resolve_conflict(self._dc_shared_dir(), body.get("token") or "", body.get("action") or "new_version"))
-        except Exception as e:
-            self.send_json(502, {"error": str(e)})
-
-    def api_datacenter_download_child(self):
-        body = self.read_body()
-        cid = body.get("child_id") or ""
-        if not cid:
-            self.send_json(400, {"error": "missing child_id"}); return
-        try:
-            raw = dcc.download_child_bytes(self._dc_shared_dir(), cid)
-            self.send_json(200, {"ok": True, "dataUrl": dcc.bytes_to_data_url(raw)})
-        except Exception as e:
-            self.send_json(502, {"error": str(e)})
-
-    def api_datacenter_delete_child(self):
-        body = self.read_body()
-        cid = body.get("child_id") or ""
-        if not cid:
-            self.send_json(400, {"error": "missing child_id"}); return
-        try:
-            self.send_json(200, dcc.delete_child(self._dc_shared_dir(), cid))
-        except Exception as e:
-            self.send_json(502, {"error": str(e)})
-
-    def api_datacenter_merge(self):
-        body = self.read_body()
-        ids = body.get("child_ids") or body.get("children") or []
-        if isinstance(ids, str): ids = [ids]
-        try:
-            self.send_json(200, dcc.merge_packages(self._dc_shared_dir(), ids, body.get("target_name") or "", body.get("generator_name") or ""))
-        except Exception as e:
-            self.send_json(502, {"error": str(e)})
-
-    def api_datacenter_download_parent(self):
-        body = self.read_body()
-        pid = body.get("parent_id") or ""
-        if not pid:
-            self.send_json(400, {"error": "missing parent_id"}); return
-        try:
-            self.send_json(200, {"ok": True, **dcc.download_parent_children(self._dc_shared_dir(), pid)})
-        except Exception as e:
-            self.send_json(502, {"error": str(e)})
 
     def api_asset_package_export(self, pid, user_name=""):
         pid = safe_name(pid)
@@ -5611,40 +5276,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "data": err_data,
                 "usage": get_user_usage(user_name),
             })
-
-    def api_review_note_image_upload(self):
-        body = self.read_body()
-        pid = safe_name(body.get("project") or "")
-        scene_id = body.get("scene_id") or ""
-        shot_id = body.get("shot_id") or ""
-        round_no = parse_positive_int(body.get("round"), 1) or 1
-        round_no = min(max(round_no, 1), 3)
-        data = self.begin_project_mutation(pid)
-        scene, shot = find_shot(data, shot_id)
-        if scene_id and scene.get("scene_id") != scene_id:
-            self.send_json(400, {"error": "scene and shot mismatch"}); return
-        raw, ext = parse_data_url(body.get("dataUrl") or "")
-        requested = safe_file_name(Path(body.get("filename") or "审核备注图片").stem, "审核备注图片")
-        scene_code = safe_file_name(scene.get("scene_code") or scene_code_from_number(scene_number_from_scene(scene, 1)), "SC")
-        out_dir = project_path(pid) / "review_notes" / scene_code / shot_id / f"round_{round_no}"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        name = requested
-        out = out_dir / f"{name}{ext}"
-        n = 2
-        while out.exists():
-            name = f"{requested}_{n}"
-            out = out_dir / f"{name}{ext}"
-            n += 1
-        out.write_bytes(raw)
-        rel = out.relative_to(project_path(pid)).as_posix()
-        public = f"{project_temp_public_prefix(pid)}/{rel}"
-        note = shot.setdefault("review_notes_by_round", {}).setdefault(str(round_no), {"text": "", "images": [], "active_index": 0})
-        img = {"note_image_id": new_id("noteimg"), "file_path": public, "name": out.stem, "created_at": now_str()}
-        note.setdefault("images", []).append(img)
-        note["active_index"] = max(0, len(note.get("images", [])) - 1)
-        save_project(pid, data)
-        self.send_json(200, {"ok": True, "data": data, "image": img})
-
 
     def api_storage_delete_images(self):
         body = self.read_body()
