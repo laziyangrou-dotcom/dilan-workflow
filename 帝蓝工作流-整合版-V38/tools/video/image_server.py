@@ -36,6 +36,11 @@ DEFAULT_VIDEO_MODEL = "doubao-seedance-2-0-260128"
 FAST_VIDEO_MODEL = "doubao-seedance-2-0-fast-260128"
 V25_VIDEO_MODEL = "doubao-seedance-2-5-260628"
 VIDEO_MODEL_LABELS = {
+    # 新显示名（锦童动视系列）
+    "锦童动视2.0": DEFAULT_VIDEO_MODEL,
+    "锦童动视2.0fast": FAST_VIDEO_MODEL,
+    "锦童动视2.5": V25_VIDEO_MODEL,
+    # 旧工程存的历史显示名，继续兼容
     "seedance2.0": DEFAULT_VIDEO_MODEL,
     "seedance2.0fast": FAST_VIDEO_MODEL,
     "seedance2.5": V25_VIDEO_MODEL,
@@ -43,7 +48,7 @@ VIDEO_MODEL_LABELS = {
     FAST_VIDEO_MODEL: FAST_VIDEO_MODEL,
     V25_VIDEO_MODEL: V25_VIDEO_MODEL,
 }
-VIDEO_MODEL_DISPLAY = {DEFAULT_VIDEO_MODEL: "seedance2.0", FAST_VIDEO_MODEL: "seedance2.0fast", V25_VIDEO_MODEL: "seedance2.5"}
+VIDEO_MODEL_DISPLAY = {DEFAULT_VIDEO_MODEL: "锦童动视2.0", FAST_VIDEO_MODEL: "锦童动视2.0fast", V25_VIDEO_MODEL: "锦童动视2.5"}
 PROJECT_MODULE_TYPE = "video"
 PROJECT_MODULE_LABEL = "视频模块"
 PROJECT_PACKAGE_TYPE = "dilan_project_package"
@@ -3066,7 +3071,7 @@ def validate_project_package_module(manifest, project_data=None):
     if package_type == "dilan_asset_package":
         raise ValueError("请选择工程包，不要选择素材包")
     if package_type and package_type not in (PROJECT_PACKAGE_TYPE, LEGACY_PROJECT_PACKAGE_TYPE):
-        raise ValueError("该 ZIP 不是帝蓝工作流工程包，无法导入")
+        raise ValueError("该 ZIP 不是锦童工作流工程包，无法导入")
     module_type = detect_project_package_module(manifest, project_data)
     if not module_type:
         # 兼容 V29 前的老工程包：无模块标识、内容指纹也无法判别（老分镜包与未启用

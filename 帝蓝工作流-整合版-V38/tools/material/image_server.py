@@ -29,20 +29,22 @@ from urllib.parse import urlsplit, parse_qs, unquote
 PORT = int(os.environ.get("DILAN_CHILD_PORT", "8787"))
 OPENAI_BASE = "https://api.openai.com/v1"
 GPT_RESPONSES_MODEL = "gpt-5.5"
-GPT_IMAGE_MODEL_OPTION = "gpt生图"
-# V24：新增 Gemini 图片模型（Nano Banana 系列）。下拉显示名 -> 实际 model id。
-NANO_BANANA_PRO_OPTION = "Nano Banana Pro"
-NANO_BANANA_2_OPTION = "Nano Banana 2"
+GPT_IMAGE_MODEL_OPTION = "锦童智能生图"
+# Gemini 图片模型（锦童图形编辑系列）。下拉显示名 -> 实际 model id。
+NANO_BANANA_PRO_OPTION = "锦童图形编辑"
+NANO_BANANA_2_OPTION = "锦童图形编辑fast"
 GEMINI_MODEL_ID = {
     NANO_BANANA_PRO_OPTION: "gemini-3-pro-image",
     NANO_BANANA_2_OPTION: "gemini-3.1-flash-image",
 }
 IMAGE_MODEL_OPTIONS = [GPT_IMAGE_MODEL_OPTION, NANO_BANANA_PRO_OPTION, NANO_BANANA_2_OPTION]
+# 旧工程/旧设置里存的历史显示名，归一到新显示名
+LEGACY_IMAGE_MODEL_ALIASES = {"gpt生图": GPT_IMAGE_MODEL_OPTION, "Nano Banana Pro": NANO_BANANA_PRO_OPTION, "Nano Banana 2": NANO_BANANA_2_OPTION}
 GEMINI_HOST = "https://generativelanguage.googleapis.com"
 # 图像模型在不同 API 版本下的可用性不一致，按 v1beta 优先、v1 兜底依次尝试。
 GEMINI_API_VERSIONS = ["v1beta", "v1"]
 GEMINI_BASE = GEMINI_HOST + "/v1beta"  # 兼容旧引用
-# 各 Gemini 模型支持的分辨率（Nano Banana 2 额外支持 512）。
+# 各 Gemini 模型支持的分辨率（锦童图形编辑fast 额外支持 512）。
 GEMINI_IMAGE_SIZES = {
     NANO_BANANA_PRO_OPTION: ["1K", "2K", "4K"],
     NANO_BANANA_2_OPTION: ["512", "1K", "2K", "4K"],
@@ -112,8 +114,10 @@ AT_PATTERN = re.compile(r"@([^\s@]+)")
 
 
 def normalize_image_model(value=None):
-    """V24：支持 gpt生图 / Nano Banana Pro / Nano Banana 2，未知值回落 gpt生图。"""
+    """支持 锦童智能生图 / 锦童图形编辑 / 锦童图形编辑fast（兼容历史名），未知值回落 锦童智能生图。"""
     v = str(value or "").strip()
+    if v in LEGACY_IMAGE_MODEL_ALIASES:
+        return LEGACY_IMAGE_MODEL_ALIASES[v]
     if v in IMAGE_MODEL_OPTIONS:
         return v
     # 兼容可能传入的实际 model id
@@ -254,7 +258,7 @@ def _gemini_model_candidates(api_key, model_option):
 
 
 def call_gemini_image(api_key, model_option, prompt, settings, image_paths=None):
-    """调用 Gemini 原生图像生成（Nano Banana）。参考图走 inline_data。返回 (image_bytes, tokens)。
+    """调用 Gemini 原生图像生成（锦童图形编辑系列）。参考图走 inline_data。返回 (image_bytes, tokens)。
 
     三层自适应，确保在不同账号/版本/接口下尽量出图（依据官方 404 排查建议）：
       1) 端点版本：v1beta 优先、v1 兜底；
@@ -1832,7 +1836,7 @@ def call_gpt_execution_compiler(api_key, thread, effective_text, execution_sheet
     content.append({"type": "input_text", "text": build_execution_compiler_input(thread, effective_text, execution_sheet)})
     payload = {
         "model": GPT_RESPONSES_MODEL,
-        "instructions": "你是帝蓝工作流的生图执行单编译器。你读取聊天上下文和随消息提供的参考文档，输出最终生图执行要求，但不生成图片。只输出最终提示词正文。",
+        "instructions": "你是锦童工作流的生图执行单编译器。你读取聊天上下文和随消息提供的参考文档，输出最终生图执行要求，但不生成图片。只输出最终提示词正文。",
         "input": [{"role": "user", "content": content}],
         "tools": [],
         "store": False,
@@ -2155,14 +2159,14 @@ def gpt_responses_search_mode(settings=None):
 
 
 def should_gpt_responses_generate(user_text, explicit_mode="auto"):
-    # V23：gpt生图改为「输入提示词直接出图」单步模式，不再有聊天模式，任何非空输入都直接生图。
+    # 锦童智能生图改为「输入提示词直接出图」单步模式，不再有聊天模式，任何非空输入都直接生图。
     return True
 
 
 def build_gpt_responses_instructions(kind, referenced_assets=None, operation="generate"):
     assets_text = "、".join([a.get("name", "") for a in (referenced_assets or []) if a])
     base = [
-        "你是帝蓝工作流里的 gpt生图 模型，是一个接近 ChatGPT 的对话式生图助手。",
+        "你是锦童工作流里的 锦童智能生图 模型，是一个接近 ChatGPT 的对话式生图助手。",
         "普通输入时，你只聊天、理解、追问和整理画面方案，不要生成图片。只有用户明确输入“开始生图”时，系统才会调用生图工具。",
         "回复要使用自然中文，优先帮助用户确认主体、场景、构图、镜头、风格、光线、材质、比例和限制条件。",
         "如果用户已经描述清楚，请整理成可执行的画面理解，并提示：确认后输入“开始生图”。",
@@ -2576,7 +2580,7 @@ def call_gpt_responses_image(api_key, thread, prompt, settings, operation="gener
     }
     payload = {
         "model": GPT_RESPONSES_MODEL,
-        "instructions": "你是帝蓝工作流的最终生图执行模型。你只能依据本次输入的最终提示词和按顺序提供的图片执行，不得读取、延续、猜测或引用任何聊天历史。必须严格遵守图一、图二、图三的映射关系。",
+        "instructions": "你是锦童工作流的最终生图执行模型。你只能依据本次输入的最终提示词和按顺序提供的图片执行，不得读取、延续、猜测或引用任何聊天历史。必须严格遵守图一、图二、图三的映射关系。",
         "input": build_gpt_responses_history_input({}, prompt, image_paths=image_paths),
         "tools": [image_tool],
         "tool_choice": {"type": "image_generation"},
@@ -4049,7 +4053,7 @@ def validate_project_package_module(manifest, project_data=None):
     if package_type == "dilan_asset_package":
         raise ValueError("请选择工程包，不要选择素材包")
     if package_type and package_type not in (PROJECT_PACKAGE_TYPE, LEGACY_PROJECT_PACKAGE_TYPE):
-        raise ValueError("该 ZIP 不是帝蓝工作流工程包，无法导入")
+        raise ValueError("该 ZIP 不是锦童工作流工程包，无法导入")
     module_type = detect_project_package_module(manifest, project_data)
     if not module_type:
         # 兼容 V29 前的老工程包：无模块标识、内容指纹也无法判别（老分镜包与未启用
@@ -5085,7 +5089,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         scene, shot, tab = find_tab(data, shot_id, tab_id)
         redo_id = body.get("redo_message_id") or ""
         settings = tab.get("settings") or data.get("project_settings") or project_default_settings(load_config()["global_defaults"])
-        # 只保留 gpt生图：普通输入默认聊天；只有明确输入“开始生图”等指令才生成。
+        # 只保留 锦童智能生图：普通输入默认聊天；只有明确输入“开始生图”等指令才生成。
         if should_gpt_responses_generate(user_text, explicit):
             return self._perform_gpt_responses_generate(pid, data, scene, shot, tab, user_text, api_key, explicit, selected_base_id, user_name, redo_id, gemini_api_key=gemini_api_key)
         return self._perform_gpt_responses_chat(pid, data, scene, shot, tab, user_text, api_key, user_name, redo_id)
@@ -5128,7 +5132,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     reply, tokens, response_id = call_gpt_responses_chat(api_key, tab, user_text, settings, referenced_assets)
             else:
                 assets_text = "、".join([a.get("name", "") for a in referenced_assets])
-                reply = "这是 gpt生图 的聊天模式。"
+                reply = "这是 锦童智能生图 的聊天模式。"
                 if assets_text:
                     reply += f" 当前已引用素材：{assets_text}。"
                 if mentioned_doc_assets:
@@ -5252,7 +5256,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # V28: image generation is isolated; do not replace chat response_id with image response_id.
                 if image_call_id:
                     state["last_image_call_id"] = image_call_id
-                tab2.setdefault("messages", []).append({"message_id": new_id("msg"), "role": "assistant", "content": "gpt生图已生成 1 张图片。", "time": now_str(), "operation": operation, "kind": "gpt_generate", "image_id": img["image_id"], "reply_to_message_id": user_msg_id})
+                tab2.setdefault("messages", []).append({"message_id": new_id("msg"), "role": "assistant", "content": "锦童智能生图已生成 1 张图片。", "time": now_str(), "operation": operation, "kind": "gpt_generate", "image_id": img["image_id"], "reply_to_message_id": user_msg_id})
                 usage = record_usage(user_name, "image", GPT_RESPONSES_MODEL + "/" + model, tokens, pid, shot2.get("shot_id"), tab2.get("tab_id"), scene=scene2, shot=shot2) if tokens else get_user_usage(user_name)
                 append_operation_log(pid, "gpt_responses_image_success", user_name=user_name, scene_code=scene2.get("scene_code"), shot_code=shot2.get("shot_code"), shot_id=shot2.get("shot_id"), tab_id=tab2.get("tab_id"), prompt=latest_text, output_path=img.get("file_path"), image_id=img.get("image_id"), operation=operation, model=GPT_RESPONSES_MODEL)
                 create_project_snapshot(pid, "gpt_responses_image_success", data=latest, user_name=user_name)

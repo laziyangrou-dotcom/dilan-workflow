@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-帝蓝工作流整合版 V47
+锦童工作流整合版 V1
 - 统一入口： http://127.0.0.1:8787/material 或 /video
 - 美术、视频工具作为两个独立子服务运行，核心代码互不合并。
 """
@@ -155,7 +155,7 @@ def set_user_env_var_windows(name: str, value: str):
 
 
 class GatewayHandler(http.server.BaseHTTPRequestHandler):
-    server_version = "DilanIntegratedV47/1.0"
+    server_version = "JintongIntegratedV1/1.0"
 
     def log_message(self, fmt, *args):
         print("[gateway]", self.address_string(), "-", fmt % args)
@@ -409,7 +409,7 @@ def handle_exit_signal(signum, frame):
 
 def main():
     print("============================================")
-    print("帝蓝工作流整合版 V47")
+    print("锦童工作流整合版 V1")
     print("统一入口: http://127.0.0.1:%s/material" % GATEWAY_PORT)
     print("素材子服务: http://127.0.0.1:%s" % MATERIAL_PORT)
     print("视频子服务: http://127.0.0.1:%s" % VIDEO_PORT)

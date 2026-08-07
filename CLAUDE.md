@@ -1,12 +1,12 @@
-# 帝蓝工作流 · Claude Code 开发必读
+# 锦童工作流 · Claude Code 开发必读
 
-AI 视频/图片生成桌面工具（Windows 本地运行，中文界面）。仓库只有一个程序：**整合版**（文件夹 `帝蓝工作流-整合版-V38`），含 **美术** 与 **视频** 两个模块。完整背景、版本史、子系统设计见根目录 **《开发交接文档.md》**（改动前先读它）。
+AI 视频/图片生成桌面工具（Windows 本地运行，中文界面）。品牌为**锦童**（原帝蓝，V1 起改名）。仓库只有一个程序：**整合版**（物理文件夹名保留为 `帝蓝工作流-整合版-V38`，**不许改名**——用户本地运行数据在里面），含 **美术** 与 **视频** 两个模块。完整背景、版本史、子系统设计见根目录 **《开发交接文档.md》**（改动前先读它）。
 
-> V47 起已整体移除：数据中心、统一审核端两个程序；分镜(image)模块；整合版内的数据中心上传下载与三轮审核/审核备注功能。工程包/素材包的**本地导出与导入**保留。不要把这些已删子系统当作现存功能来改。
+> 大精简（原 V47）已整体移除：数据中心、统一审核端两个程序；分镜(image)模块；整合版内的数据中心上传下载与三轮审核/审核备注功能。工程包/素材包的**本地导出与导入**保留。不要把这些已删子系统当作现存功能来改。
 
 ## 铁律（用户明确约定，违反会返工）
 
-1. **每次修改都要把产品版本号 +1**（当前 **V47**）。只改"显示字符串"，共 10 处 6 个文件：两端 `tools/{material,video}/index.html` 的 `<title>` 与顶部横幅（各 2 处）、整合版 `README.md`（1）、`integrated_server.py`（3：docstring/server_version/启动打印）、`start.bat`（1）、`tools/material/start.bat`（1）。**文件夹名固定 `-V38` 不许改名**。`TOS_配置与验收说明.md` 里的"V41 起"是特性起始版本，保留不动。
+1. **每次修改都要把产品版本号 +1**（版本序列已重置：当前 **V1**，下次改动 V2）。只改"显示字符串"，共 10 处 6 个文件：两端 `tools/{material,video}/index.html` 的 `<title>` 与顶部横幅（各 2 处）、整合版 `README.md`（1）、`integrated_server.py`（3：docstring/server_version/启动打印）、`start.bat`（1）、`tools/material/start.bat`（1）。**文件夹名固定 `-V38` 不许改名**。`TOS_配置与验收说明.md` 里的"V41 起"是旧序列的特性起始标注，保留不动。
 2. **AK/SK 绝不写入任何 JSON/代码/localStorage**，只走环境变量 `VOLC_TOS_ACCESS_KEY_ID` / `VOLC_TOS_SECRET_ACCESS_KEY`（兼容读 `TOS_ACCESS_KEY_ID`/`TOS_SECRET_ACCESS_KEY`）。设置页提供"写入 Windows 用户环境变量"的功能，写入后需重启程序生效。
 3. **两端页面只加载 index.html 的内联 `<script>`**。`tools/*/script.js` 是历史死文件——往里写代码页面根本不会执行（V36 曾因此"点击生成无反应"）。
 4. **不要在本地预检/拦截 Ark（火山方舟）的规则**（音频时长、素材数量等）。V38 加过预检、V39 被用户要求撤销：本地猜规则会误拦，以官方接口报错为准。
@@ -15,7 +15,7 @@ AI 视频/图片生成桌面工具（Windows 本地运行，中文界面）。�
 
 ## 架构速览
 
-- 网关 `帝蓝工作流-整合版-V38/integrated_server.py`（**:8787**），按 HTTP Referer/路径把请求代理到两个子服务：**material :8790（美术）/ video :8789（视频 Seedance）**。
+- 网关 `帝蓝工作流-整合版-V38/integrated_server.py`（对外品牌显示均为锦童）（**:8787**），按 HTTP Referer/路径把请求代理到两个子服务：**material :8790（美术）/ video :8789（视频 Seedance）**。
 - 子服务 `tools/{material,video}/image_server.py`（各 ~5000+ 行，`ThreadingHTTPServer`，**两端高度同构**——改公共逻辑通常两份都要改，用脚本批量替换并断言命中次数）。
 - 前端 = 各端单文件 `tools/*/index.html`（内联脚本）。
 - 数据：`tools/<模块>/projects/<项目>/project.json`（结构 scenes→shots→tabs→{messages, generated_images, generated_videos(同一数组镜像), last_video_status, referenced_assets, draft_prompt, settings}）；素材在 `input/`，生成结果在 `output/image|video/`。美术端另有 `material_workspaces{character,scene,object}` 工作区槽 + `active_material_workspace`（权威归属字段，防串槽）。父项目跨两模块共享（`shared_project_index`，`PROJECT_MODULE_KEYS=["material","video"]`）。
@@ -50,3 +50,11 @@ python3 -m py_compile 帝蓝工作流-整合版-V38/tools/{material,video}/image
 #    后端并发用 importlib 加载 image_server.py、把 PROJECTS_DIR 等指到临时目录后 threading 压测。
 ```
 沙箱能 import 测本地逻辑，**连不上** TOS/Ark 外网域名。
+
+## 品牌与模型显示名（V1 起）
+
+- 品牌：界面/文档/提示一律"锦童"；物理文件夹名与 localStorage/内部键（dilan*、DILAN_*、dilan_project_package）为兼容保留，不改。
+- UI 主题：浅粉暖色（页面底 #f8efe9、卡片 #ffffff、强调玫瑰粉 #d98a94、正文 #4a3b37）；状态点绿/黄/红与视频容器黑底为语义色，保留。
+- 视频模型显示名：锦童动视2.0 / 锦童动视2.0fast / 锦童动视2.5（对应 Ark ID 不变：doubao-seedance-2-0-260128 / -fast- / 2-5-260628）。旧工程存的 seedance* 旧名由 modelDisplay/VIDEO_MODEL_LABELS 兼容归一。
+- 图像模型显示名：锦童智能生图（原 gpt生图，走 OpenAI Key）/ 锦童图形编辑（原 Nano Banana Pro → gemini-3-pro-image）/ 锦童图形编辑fast（原 Nano Banana 2 → gemini-3.1-flash-image）。旧名由 normImgModel/LEGACY_IMAGE_MODEL_ALIASES 兼容归一。
+- **API 实际 model id 一律不改**；改显示名必须同时保旧值兼容（settings 里存的是显示名）。
