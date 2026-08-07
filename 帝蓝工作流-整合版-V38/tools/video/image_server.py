@@ -34,13 +34,16 @@ CHAT_MODEL = "gpt-4.1-mini"
 ARK_BASE = "https://ark.cn-beijing.volces.com/api/v3"
 DEFAULT_VIDEO_MODEL = "doubao-seedance-2-0-260128"
 FAST_VIDEO_MODEL = "doubao-seedance-2-0-fast-260128"
+V25_VIDEO_MODEL = "doubao-seedance-2-5-260628"
 VIDEO_MODEL_LABELS = {
     "seedance2.0": DEFAULT_VIDEO_MODEL,
     "seedance2.0fast": FAST_VIDEO_MODEL,
+    "seedance2.5": V25_VIDEO_MODEL,
     DEFAULT_VIDEO_MODEL: DEFAULT_VIDEO_MODEL,
     FAST_VIDEO_MODEL: FAST_VIDEO_MODEL,
+    V25_VIDEO_MODEL: V25_VIDEO_MODEL,
 }
-VIDEO_MODEL_DISPLAY = {DEFAULT_VIDEO_MODEL: "seedance2.0", FAST_VIDEO_MODEL: "seedance2.0fast"}
+VIDEO_MODEL_DISPLAY = {DEFAULT_VIDEO_MODEL: "seedance2.0", FAST_VIDEO_MODEL: "seedance2.0fast", V25_VIDEO_MODEL: "seedance2.5"}
 PROJECT_MODULE_TYPE = "video"
 PROJECT_MODULE_LABEL = "视频模块"
 PROJECT_PACKAGE_TYPE = "dilan_project_package"
@@ -3704,12 +3707,17 @@ def estimate_seedance_cost(prompt: str, settings: dict, data: dict):
         if a and a.get("category") == "视频":
             has_video_input = True
             break
-    if model == FAST_VIDEO_MODEL:
-        price = float(cfg.get("seedance_fast_with_video_cny_per_million") if has_video_input else cfg.get("seedance_fast_no_video_cny_per_million") or 0)
+    # 注意括号：or 0 必须作用于两个分支的取值结果，否则配置键缺失时 float(None) 直接崩溃。
+    if model == V25_VIDEO_MODEL:
+        price = float((cfg.get("seedance_v25_with_video_cny_per_million") if has_video_input else cfg.get("seedance_v25_no_video_cny_per_million")) or 0)
+        if price <= 0:
+            price = 42.0 if has_video_input else 70.0
+    elif model == FAST_VIDEO_MODEL:
+        price = float((cfg.get("seedance_fast_with_video_cny_per_million") if has_video_input else cfg.get("seedance_fast_no_video_cny_per_million")) or 0)
     else:
-        price = float(cfg.get("seedance_regular_with_video_cny_per_million") if has_video_input else cfg.get("seedance_regular_no_video_cny_per_million") or 0)
+        price = float((cfg.get("seedance_regular_with_video_cny_per_million") if has_video_input else cfg.get("seedance_regular_no_video_cny_per_million")) or 0)
     if price <= 0:
-        price = 22.0 if model == FAST_VIDEO_MODEL and has_video_input else 37.0 if model == FAST_VIDEO_MODEL else 28.0 if has_video_input else 46.0
+        price = 22.0 if model == FAST_VIDEO_MODEL and has_video_input else 37.0 if model == FAST_VIDEO_MODEL else 42.0 if model == V25_VIDEO_MODEL and has_video_input else 70.0 if model == V25_VIDEO_MODEL else 28.0 if has_video_input else 46.0
     w, h = video_dimensions(resolution, ratio)
     billed_seconds = duration + (unknown_input_seconds if has_video_input else 0)
     tokens = int(round(billed_seconds * w * h * fps / 1024))
@@ -4260,6 +4268,12 @@ def seedance_payload(prompt: str, settings: dict, data: dict, tab: dict, pid: st
     seed = str(settings.get("video_seed") or "").strip()
     if seed and re.fullmatch(r"\d+", seed):
         payload["seed"] = int(seed)
+    if model == V25_VIDEO_MODEL:
+        # seedance2.5 严格按官方示例只发 model/content/ratio/duration/generate_audio/watermark：
+        # 官方示例不含 resolution 与 seed，多发未列出的字段有被 Ark 拒绝的风险（用户确认的取舍）。
+        # 分辨率下拉对 2.5 仅参与本地费用预估，不进请求体。
+        payload.pop("resolution", None)
+        payload.pop("seed", None)
     return payload
 
 
